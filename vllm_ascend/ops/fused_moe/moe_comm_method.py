@@ -20,11 +20,13 @@ from dataclasses import dataclass
 from typing import cast
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cam_fused_deep_moe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe import moe_utils
@@ -300,7 +302,20 @@ class FusedMC2CommImpl(MoECommMethod):
         super().__init__(moe_config)
         self._mega_moe_hccl_state_stale = False
         self.enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if self.enable_fused_mc2 == 1 and is_mega_moe_supported():
+        self.cam_fused_deep_moe = None
+        self._cam_static_inputs_validated = False
+        vllm_config = get_current_vllm_config_or_none()
+        use_cam = vllm_config is not None and use_cam_fused_deep_moe(vllm_config)
+        if use_cam:
+            try:
+                self.cam_fused_deep_moe = moe_utils.load_cam_fused_deep_moe_op()
+            except RuntimeError as exc:
+                logger.warning_once(
+                    "CAM fused_deep_moe could not be loaded (%s); fused MC2 will use "
+                    "dispatch_ffn_combine.",
+                    exc,
+                )
+        if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not use_cam:
             self.mega_moe_symm_buffer = None
             self.get_symm_buffer_for_mega_moe, self.mega_moe = moe_utils.load_cann_mega_moe_ops()
             # Resolve the Python ABI once, before the first collective/capture.
@@ -560,29 +575,138 @@ class FusedMC2CommImpl(MoECommMethod):
         # return value, so there is nothing to keep on the instance.
         return out, expert_tokens
 
+    def _apply_cam_fused_deep_moe(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        weights,
+    ):
+        """Map FusedMC2 tensors onto the routed-only CAM fused_deep_moe ABI."""
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+
+        def to_list(value):
+            if value is None:
+                return None
+            return value if isinstance(value, list) else [value]
+
+        w1 = to_list(weights.w1)
+        w2 = to_list(weights.w2)
+        w1_scale = to_list(weights.w1_scale)
+        w2_scale = to_list(weights.w2_scale)
+        w1_scale_bias = to_list(weights.w1_scale_bias)
+        w2_scale_bias = to_list(weights.w2_scale_bias)
+        layer = fused_experts_input.layer
+        if not getattr(layer, moe_utils.CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR, False):
+            moe_utils.validate_cam_fused_deep_moe_payload(
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_scale_bias=w1_scale_bias,
+                w2_scale_bias=w2_scale_bias,
+            )
+            if layer is not None:
+                setattr(layer, moe_utils.CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR, True)
+
+        hidden_states = fused_experts_input.hidden_states
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "CAM fused_deep_moe currently supports float16/bfloat16 activations, "
+                f"got {hidden_states.dtype}."
+            )
+        activation = fused_experts_input.activation
+        if activation in (MoEActivation.SITU, "situ"):
+            raise ValueError(
+                "CAM fused_deep_moe currently supports silu/swiglu routed experts only, "
+                f"got activation={activation}."
+            )
+        batch_size = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+        top_k = fused_experts_input.topk_ids.shape[1]
+        ep_world_size = int(self.token_dispatcher.ep_world_size)
+        global_bs = int(self.token_dispatcher.global_bs)
+        if not getattr(self, "_cam_static_inputs_validated", False):
+            moe_utils.validate_cam_fused_deep_moe_static_inputs(
+                hidden_size=hidden_size,
+                num_experts=self.moe_config.num_experts,
+                ep_world_size=ep_world_size,
+                global_bs=global_bs,
+            )
+            self._cam_static_inputs_validated = True
+        moe_utils.validate_cam_fused_deep_moe_shape_inputs(
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            gmm1_hidden=2 * self.moe_config.intermediate_size_per_partition,
+            top_k=top_k,
+        )
+
+        x_active_mask = None
+        if global_bs == 0 and fused_experts_input.routing.mc2_mask is not None:
+            raw_mask = fused_experts_input.routing.mc2_mask
+            x_active_mask = raw_mask if raw_mask.dtype == torch.bool else raw_mask.to(torch.bool)
+
+        output, _share_output, expert_tokens = self.cam_fused_deep_moe(
+            x=hidden_states,
+            expert_ids=fused_experts_input.topk_ids.to(torch.int32),
+            gmm1_weight=w1,
+            gmm1_weight_scale=w1_scale,
+            gmm2_weight=w2,
+            gmm2_weight_scale=w2_scale,
+            expert_scales=fused_experts_input.topk_weights.to(torch.float32),
+            share_gmm1_weight=None,
+            share_gmm1_weight_scale=None,
+            share_gmm2_weight=None,
+            share_gmm2_weight_scale=None,
+            expert_smooth_scales=None,
+            share_smooth_scales=None,
+            x_active_mask=x_active_mask,
+            gmm1_bias=w1_scale_bias,
+            gmm2_bias=w2_scale_bias,
+            share_gmm1_bias=None,
+            share_gmm2_bias=None,
+            group_ep=self.token_dispatcher.moe_all_to_all_group_name,
+            ep_rank_size=ep_world_size,
+            ep_rank_id=int(self.token_dispatcher.ep_rank_id),
+            moe_expert_num=int(self.moe_config.num_experts),
+            quant_mode=moe_utils.CAM_FUSED_DEEP_MOE_QUANT_MODE,
+            global_bs=global_bs,
+        )
+        return output, expert_tokens
+
     def fused_experts(
         self,
         fused_experts_input: MoEFusedExpertsInput,
         quant_method=None,
     ):
-        if quant_method is not None:
-            weights = quant_method.get_fused_mc2_weights(fused_experts_input.layer)
-        else:
-            # Backward-compatible fallback for legacy callers that still build
-            # the weight payload through build_fused_experts_input.
-            weights = fused_experts_input.weights
-
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
 
         expert_tokens = None
         if self.enable_fused_mc2 == 1:
-            if _EXTRA_CTX.use_mega_moe:
+            cam_selected = bool(getattr(_EXTRA_CTX, "use_cam_fused_deep_moe", False))
+            use_cam = cam_selected and self.cam_fused_deep_moe is not None
+            if use_cam and fused_experts_input.quant.quant_type == QuantType.W4A8:
+                get_cam_weights = getattr(quant_method, "get_cam_fused_deep_moe_weights", None)
+                if get_cam_weights is None:
+                    raise RuntimeError(
+                        "CAM fused_deep_moe was selected but the quantization method "
+                        "does not expose a CAM W4A8 payload."
+                    )
+                weights = get_cam_weights(fused_experts_input.layer)
+                out, expert_tokens = self._apply_cam_fused_deep_moe(fused_experts_input, weights)
+            elif _EXTRA_CTX.use_mega_moe and not cam_selected:
+                if quant_method is not None:
+                    weights = quant_method.get_fused_mc2_weights(fused_experts_input.layer)
+                else:
+                    weights = fused_experts_input.weights
                 out, expert_tokens = self._apply_cann_mega_moe(
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
                 )
             else:
+                if quant_method is not None:
+                    weights = quant_method.get_fused_mc2_weights(fused_experts_input.layer)
+                else:
+                    weights = fused_experts_input.weights
                 assert not (weights.w1_scale_bias is None or weights.w2_scale_bias is None), (
                     "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
                 )

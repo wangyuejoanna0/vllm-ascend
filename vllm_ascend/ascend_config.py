@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 _MEGA_MOE_SUPPORTED = None
+_CAM_FUSED_DEEP_MOE_SUPPORTED = None
 
 
 def is_mega_moe_supported() -> bool:
@@ -49,6 +50,18 @@ def is_mega_moe_supported() -> bool:
     if _MEGA_MOE_SUPPORTED is None:
         _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
     return _MEGA_MOE_SUPPORTED
+
+
+def is_cam_fused_deep_moe_supported() -> bool:
+    """Return whether the optional UMDK CAM wheel is importable.
+
+    Config probing stays ``find_spec``-only so CPU unit tests never import the
+    NPU extension. Operator arguments are checked when the op is loaded.
+    """
+    global _CAM_FUSED_DEEP_MOE_SUPPORTED
+    if _CAM_FUSED_DEEP_MOE_SUPPORTED is None:
+        _CAM_FUSED_DEEP_MOE_SUPPORTED = importlib.util.find_spec("umdk_cam_op_lib") is not None
+    return _CAM_FUSED_DEEP_MOE_SUPPORTED
 
 
 def validate_additional_config_bool(value: Any, path: str) -> bool:
@@ -440,6 +453,7 @@ class AscendConfig:
             "mega_moe_max_tokens": 65536,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "enable_fused_mc2": 0,
+            "enable_cam_fused_deep_moe": false,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
@@ -606,6 +620,8 @@ class AscendConfig:
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
+    # Optional A3 W4A8 routed-only CAM backend for fused MC2. Default off.
+    enable_cam_fused_deep_moe: bool = False
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
@@ -831,6 +847,26 @@ class AscendConfig:
 
         # enable_fused_mc2 enum + MiniMax mutex + multistream auto-disable
         assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
+        if self.enable_cam_fused_deep_moe:
+            if self.enable_fused_mc2 != 1:
+                raise ValueError("enable_cam_fused_deep_moe requires enable_fused_mc2=1.")
+            if not get_current_hardware_profile().supports(HardwareCapability.CAM_FUSED_DEEP_MOE):
+                raise NotImplementedError("CAM fused_deep_moe is supported only on Ascend A3 hardware.")
+            if self.eplb_config.dynamic_eplb:
+                raise ValueError("CAM fused_deep_moe does not support dynamic EPLB.")
+            if getattr(vc.parallel_config, "enable_eplb", False):
+                raise ValueError("CAM fused_deep_moe does not support EPLB.")
+            if vc.lora_config is not None:
+                raise ValueError("CAM fused_deep_moe does not support LoRA.")
+            model_architectures = getattr(getattr(vc, "model_config", None), "architectures", None) or []
+            if any(architecture.startswith("MiniMaxM3") for architecture in model_architectures):
+                raise ValueError("CAM fused_deep_moe does not support MiniMax M3 SwiGLU-OAI.")
+            if not is_cam_fused_deep_moe_supported():
+                self.enable_cam_fused_deep_moe = False
+                logger.warning_once(
+                    "umdk_cam_op_lib is not installed; CAM fused_deep_moe is disabled "
+                    "and fused MC2 continues with MegaMoe or dispatch_ffn_combine."
+                )
         model_architectures = getattr(vc.model_config, "architectures", None) or []
         is_minimax_m3 = any(architecture.startswith("MiniMaxM3") for architecture in model_architectures)
         # dispatch_ffn_combine (enable_fused_mc2=1 after MegaMoe rollback) does not

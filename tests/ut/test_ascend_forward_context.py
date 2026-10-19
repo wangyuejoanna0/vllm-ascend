@@ -150,6 +150,21 @@ def test_deepseek_v4_forward_passes_input_ids_to_layers(monkeypatch):
     assert "input_ids" not in forward_context.additional_kwargs
 
 
+def test_set_mc2_tokens_capacity_cam_caps_tokens_per_rank(monkeypatch):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_prefill_mc2=False, enable_fused_mc2=1),
+    )
+    monkeypatch.setattr(afc, "use_cam_fused_deep_moe", lambda _: True)
+    monkeypatch.setattr(afc, "use_cann_megamoe", lambda _: False)
+    vllm_config = _make_vllm_config(tensor_parallel_size=2, max_num_batched_tokens=2048)
+
+    afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=400, uniform_decode_query_len=4)
+
+    assert afc.get_mc2_tokens_capacity() == 512
+
+
 def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():
     vllm_config = _make_vllm_config(tensor_parallel_size=6)
 

@@ -1648,6 +1648,104 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_cam_fused_deep_moe_falls_back_without_wheel(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1, "enable_cam_fused_deep_moe": True}
+        with (
+            patch("vllm_ascend.ascend_config._CAM_FUSED_DEEP_MOE_SUPPORTED", None),
+            patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=None),
+        ):
+            config = init_ascend_config(vc)
+        self.assertFalse(config.enable_cam_fused_deep_moe)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_cam_fused_deep_moe_requires_fused_mc2(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 0, "enable_cam_fused_deep_moe": True}
+        with self.assertRaisesRegex(ValueError, "enable_cam_fused_deep_moe requires enable_fused_mc2=1"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A2),
+    )
+    def test_cam_fused_deep_moe_rejects_non_a3(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1, "enable_cam_fused_deep_moe": True}
+        with self.assertRaisesRegex(NotImplementedError, "supported only on Ascend A3"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_cam_fused_deep_moe_rejects_dynamic_eplb(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {
+            "enable_fused_mc2": 1,
+            "enable_cam_fused_deep_moe": True,
+            "eplb_config": {"dynamic_eplb": True},
+        }
+        with (
+            patch.dict(os.environ, {"DYNAMIC_EPLB": "true"}),
+            self.assertRaisesRegex(ValueError, "does not support dynamic EPLB"),
+        ):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_cam_fused_deep_moe_rejects_eplb(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1, "enable_cam_fused_deep_moe": True}
+        vc.parallel_config.enable_eplb = True
+        with self.assertRaisesRegex(ValueError, "does not support EPLB"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_cam_fused_deep_moe_rejects_minimax(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1, "enable_cam_fused_deep_moe": True}
+        vc.model_config.architectures = ["MiniMaxM3ForCausalLM"]
+        with self.assertRaisesRegex(ValueError, "does not support MiniMax M3"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_cam_fused_deep_moe_rejects_lora(self, mock_profile, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1, "enable_cam_fused_deep_moe": True}
+        vc.lora_config = object()
+        with self.assertRaisesRegex(ValueError, "does not support LoRA"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_converged_bypass_fields_are_validated(self, mock_fix):
         vc = VllmConfig()
         vc.additional_config = {

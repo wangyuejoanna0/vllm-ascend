@@ -25,11 +25,15 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cam_fused_deep_moe, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.moe_utils import (
+    CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR,
+    validate_cam_fused_deep_moe_payload,
+)
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
@@ -352,6 +356,70 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         return weight.view(torch.int32).contiguous()
 
+    @staticmethod
+    def _as_cam_float_scale(scale: torch.Tensor) -> torch.Tensor:
+        """Capture unpacked W4A8 scales as float32 before INT64 packing."""
+        squeezed = scale.detach()
+        if squeezed.dim() > 2 and squeezed.shape[-1] == 1:
+            squeezed = squeezed.squeeze(-1)
+        if squeezed.dim() > 2 and squeezed.shape[1] == 1:
+            squeezed = squeezed.squeeze(1)
+        if squeezed.dtype == torch.int64:
+            raise ValueError(
+                "CAM fused_deep_moe cannot consume INT64 packed W4A8 scales. "
+                "Capture the float scales before _process_scale."
+            )
+        return squeezed.to(torch.float32).contiguous()
+
+    @staticmethod
+    def _cam_per_expert_float_list(tensor: torch.Tensor, num_experts: int) -> list[torch.Tensor]:
+        data = tensor
+        if data.dim() >= 2 and data.shape[0] == num_experts:
+            return [expert.reshape(-1).to(torch.float32).clone() for expert in data.unbind(0)]
+        if data.dim() == 1:
+            return [data.reshape(-1).to(torch.float32).clone()]
+        raise ValueError(
+            f"CAM fused_deep_moe expected per-expert scales/bias with first dim {num_experts}, "
+            f"got shape {tuple(data.shape)}"
+        )
+
+    def _install_cam_fused_deep_moe_payload(
+        self,
+        layer,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> None:
+        packed_w13 = self._pack_to_int32(layer.w13_weight.data)
+        packed_w2 = self._pack_to_int32(layer.w2_weight.data)
+        layer.w13_weight.data = packed_w13
+        layer.w2_weight.data = packed_w2
+        num_experts = packed_w13.shape[0]
+        # clone() so each TensorList entry has storage_offset 0. contiguous() is
+        # a no-op on already-contiguous unbind views and leaves a nonzero offset.
+        layer.cam_fused_deep_moe_w13_weight_list = [weight.clone() for weight in packed_w13.unbind(0)]
+        layer.cam_fused_deep_moe_w2_weight_list = [weight.clone() for weight in packed_w2.unbind(0)]
+        layer.cam_fused_deep_moe_w13_weight_scale_list = self._cam_per_expert_float_list(
+            w13_scale, num_experts
+        )
+        layer.cam_fused_deep_moe_w2_weight_scale_list = self._cam_per_expert_float_list(
+            w2_scale, num_experts
+        )
+        layer.cam_fused_deep_moe_w13_scale_bias_list = self._cam_per_expert_float_list(
+            layer.w13_scale_bias.data, num_experts
+        )
+        layer.cam_fused_deep_moe_w2_scale_bias_list = self._cam_per_expert_float_list(
+            layer.w2_scale_bias.data, num_experts
+        )
+        validate_cam_fused_deep_moe_payload(
+            w1=layer.cam_fused_deep_moe_w13_weight_list,
+            w2=layer.cam_fused_deep_moe_w2_weight_list,
+            w1_scale=layer.cam_fused_deep_moe_w13_weight_scale_list,
+            w2_scale=layer.cam_fused_deep_moe_w2_weight_scale_list,
+            w1_scale_bias=layer.cam_fused_deep_moe_w13_scale_bias_list,
+            w2_scale_bias=layer.cam_fused_deep_moe_w2_scale_bias_list,
+        )
+        setattr(layer, CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR, True)
+
     def _process_scale(self, scale):
         scale = scale.transpose(1, 2).contiguous()
         scale_np = scale.cpu().numpy()
@@ -371,6 +439,15 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         return weight_add.reshape(shape[:-1] + (shape[-1] // 2,)).clone()
 
     def process_weights_after_loading(self, layer):
+        vllm_config = get_current_vllm_config()
+        use_cam = use_cam_fused_deep_moe(vllm_config)
+        cam_w13_scale = None
+        cam_w2_scale = None
+        if use_cam:
+            # Capture unpacked float scales before the INT64 packing used by
+            # npu_grouped_matmul / dispatch_ffn_combine.
+            cam_w13_scale = self._as_cam_float_scale(layer.w13_weight_scale.data)
+            cam_w2_scale = self._as_cam_float_scale(layer.w2_weight_scale.data)
         if self.quant_method == COMPRESSED_TENSORS_METHOD:
             self.process_weights_after_loading_compressed_tensors(layer)
         else:
@@ -385,7 +462,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             "w13_scale_bias",
             "w2_scale_bias",
         )
-        use_mega_moe = use_cann_megamoe(get_current_vllm_config())
+        if use_cam:
+            assert cam_w13_scale is not None and cam_w2_scale is not None
+            self._install_cam_fused_deep_moe_payload(layer, cam_w13_scale, cam_w2_scale)
+            return
+        use_mega_moe = use_cann_megamoe(vllm_config)
         if self.use_expert_weight_list:
             for tensor_name in tensor_names:
                 tensor = getattr(layer, tensor_name)
@@ -476,6 +557,24 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             group_list = torch.cat([group_list[:1], torch.diff(group_list, dim=0)])
             group_list_type = 1
         return group_list, group_list_type
+
+    def get_cam_fused_deep_moe_weights(self, layer):
+        """INT32-packed W4A8 payload consumed only by the CAM fused_deep_moe path."""
+        try:
+            return MoEWeights(
+                w1=layer.cam_fused_deep_moe_w13_weight_list,
+                w2=layer.cam_fused_deep_moe_w2_weight_list,
+                w1_scale=layer.cam_fused_deep_moe_w13_weight_scale_list,
+                w2_scale=layer.cam_fused_deep_moe_w2_weight_scale_list,
+                w1_scale_bias=layer.cam_fused_deep_moe_w13_scale_bias_list,
+                w2_scale_bias=layer.cam_fused_deep_moe_w2_scale_bias_list,
+            )
+        except AttributeError as exc:
+            raise RuntimeError(
+                "CAM fused_deep_moe was selected but the INT32-packed W4A8 payload "
+                "was not built. enable_cam_fused_deep_moe must be set before weight "
+                "loading."
+            ) from exc
 
     def get_fused_mc2_weights(self, layer):
         """Normalized weight payload for the FUSED_MC2 comm path."""

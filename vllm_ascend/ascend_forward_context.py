@@ -11,7 +11,10 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
+from vllm_ascend.ascend_config import (
+    get_ascend_config,
+    is_mega_moe_supported,
+)
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     MoECommPolicy,
@@ -84,7 +87,43 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+def _is_cam_w4a8_int_quant(vllm_config: VllmConfig) -> bool:
+    """Return whether the model uses INT W4A8 rather than MXFP W4A8."""
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if quant_config is None:
+        return False
+    desc = getattr(quant_config, "quant_description", None)
+    tokens: list[str] = []
+    if isinstance(desc, dict):
+        for key, value in desc.items():
+            if isinstance(key, str):
+                tokens.append(key.upper())
+            if isinstance(value, str):
+                tokens.append(value.upper())
+    if any("MXFP" in token for token in tokens):
+        return False
+    return any("W4A8" in token for token in tokens)
+
+
+def use_cam_fused_deep_moe(vllm_config: VllmConfig) -> bool:
+    """Return whether this worker should route fused MC2 through CAM."""
+    if not getattr(get_ascend_config(), "enable_cam_fused_deep_moe", False):
+        return False
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return (
+        is_moe_model(vllm_config)
+        and bool(getattr(parallel_config, "enable_expert_parallel", False))
+        and get_ep_group().world_size > 1
+        and _is_cam_w4a8_int_quant(vllm_config)
+    )
+
+
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
+    # CAM installs an INT32 stacked payload, not MegaMoe INT8 lists. When CAM is
+    # selected, MegaMoe must stay off so a missing CAM op falls back to
+    # dispatch_ffn_combine rather than MegaMoe.
+    if use_cam_fused_deep_moe(vllm_config):
+        return False
     # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
     return (
         is_mega_moe_supported()
@@ -166,6 +205,7 @@ def set_ascend_forward_context(
         )
         forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
+        forward_context.use_cam_fused_deep_moe = use_cam_fused_deep_moe(vllm_config)
         forward_context.draft_moe_quant_type = draft_moe_quant_type
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -247,6 +287,7 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
 
     ascend_config = get_ascend_config()
     use_mega_moe = use_cann_megamoe(vllm_config)
+    use_cam = use_cam_fused_deep_moe(vllm_config)
 
     # Cap for fused MC2 / MegaMoe: regular MC2 (gated by enable_prefill_mc2) uses
     # HCCL comm buffer (HCCL_BUFFSIZE); MegaMoe (use_mega_moe, non-decode-only)
@@ -263,7 +304,11 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
     # keep the num_tokens_per_tp_rank less than fused_mc2 (mega_moe) tokens per rank limit
     if ascend_config.enable_fused_mc2:
-        if use_mega_moe:
+        if use_cam:
+            from vllm_ascend.ops.fused_moe.moe_utils import CAM_FUSED_DEEP_MOE_MAX_BATCH_SIZE
+
+            num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, CAM_FUSED_DEEP_MOE_MAX_BATCH_SIZE)
+        elif use_mega_moe:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
         else:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)
@@ -434,6 +479,7 @@ class _ExtraForwardContextProxy:
         "moe_comm_method",
         "is_decode_only_node",
         "use_mega_moe",
+        "use_cam_fused_deep_moe",
         "mmrs_fusion",
         "num_tokens",
         "padded_length",

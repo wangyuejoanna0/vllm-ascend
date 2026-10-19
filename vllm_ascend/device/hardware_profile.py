@@ -68,6 +68,8 @@ class HardwareCapability(Enum):
     CANN_MEGAMOE = auto()
     # Allow A5 MegaMoe's MXFP-only path and its A5-specific calling conventions.
     CANN_MEGAMOE_MXFP = auto()
+    # Allow the optional UMDK CAM A3 fused W4A8 DeepMoE operator.
+    CAM_FUSED_DEEP_MOE = auto()
     # Split a mixed chunked-prefill batch into separate prefill and decode FIA calls.
     CHUNKED_PREFILL_PHASE_SPLIT = auto()
     # Build CPU-affinity pools from the cluster-aware CPU topology.
@@ -276,6 +278,7 @@ _STANDARD_CAPABILITIES = frozenset(
     }
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
+    HardwareCapability.CAM_FUSED_DEEP_MOE,
     HardwareCapability.GMM_DEQUANT_SITU_QUANT,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.RMS_NORM_CAST,

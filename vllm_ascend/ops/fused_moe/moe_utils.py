@@ -16,7 +16,8 @@
 # limitations under the License.
 #
 import inspect
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from importlib import import_module
 from typing import Any
@@ -48,6 +49,47 @@ _CANN_MEGA_MOE_QUANT_MODE_MXFP = 4
 _CANN_ACL_FLOAT8_E5M2 = 23
 _CANN_ACL_FLOAT8_E4M3FN = 24
 _CANN_ACL_FLOAT4_E2M1 = 296
+
+CAM_FUSED_DEEP_MOE_MAX_BATCH_SIZE = 256
+CAM_FUSED_DEEP_MOE_MIN_HIDDEN = 512
+CAM_FUSED_DEEP_MOE_MAX_HIDDEN = 7168
+CAM_FUSED_DEEP_MOE_MAX_TOPK = 12
+CAM_FUSED_DEEP_MOE_MAX_EXPERTS = 512
+CAM_FUSED_DEEP_MOE_MIN_GMM1_HIDDEN = 1024
+CAM_FUSED_DEEP_MOE_MAX_GMM1_HIDDEN = 6144
+CAM_FUSED_DEEP_MOE_QUANT_MODE = 0
+CAM_FUSED_DEEP_MOE_DEFAULT_AIV_NUM = 48
+CAM_FUSED_DEEP_MOE_TOKEN_DTYPE_BYTES = 2
+CAM_FUSED_DEEP_MOE_DOUBLE_BUFFER = 2
+CAM_FUSED_DEEP_MOE_MB_SIZE = 1024 * 1024
+CAM_FUSED_DEEP_MOE_DEFAULT_HCCL_BUFFSIZE_MB = 200
+CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR = "_cam_fused_deep_moe_payload_validated"
+CAM_FUSED_DEEP_MOE_REQUIRED_ARGS = (
+    "x",
+    "expert_ids",
+    "gmm1_weight",
+    "gmm1_weight_scale",
+    "gmm2_weight",
+    "gmm2_weight_scale",
+    "expert_scales",
+    "share_gmm1_weight",
+    "share_gmm1_weight_scale",
+    "share_gmm2_weight",
+    "share_gmm2_weight_scale",
+    "expert_smooth_scales",
+    "share_smooth_scales",
+    "x_active_mask",
+    "gmm1_bias",
+    "gmm2_bias",
+    "share_gmm1_bias",
+    "share_gmm2_bias",
+    "group_ep",
+    "ep_rank_size",
+    "ep_rank_id",
+    "moe_expert_num",
+    "quant_mode",
+    "global_bs",
+)
 
 # dict: QuantType -> (dispatch_quant_mode, dispatch_quant_out_dtype, weight_type)
 _QUANT_SETTING_MAP: dict[QuantType, tuple[int, int | None, int | None]] = {
@@ -162,6 +204,241 @@ def load_cann_mega_moe_ops():
     else:
         comm_context.comm_context_op_builder.load()
     return get_symm_buffer_for_mega_moe, mega_moe
+
+
+@lru_cache(maxsize=1)
+def _cam_aiv_num() -> int:
+    try:
+        props = torch.npu.get_device_properties(torch.npu.current_device())
+        vector_core_num = getattr(props, "vector_core_num", None)
+        # MagicMock from CPU UTs int()-converts to 1; AIV/2 must be at least 1.
+        aiv_num = int(vector_core_num) if vector_core_num else 0
+        if aiv_num >= 2:
+            return aiv_num
+    except (RuntimeError, AttributeError, TypeError, ValueError):
+        pass
+    return CAM_FUSED_DEEP_MOE_DEFAULT_AIV_NUM
+
+
+def _cam_hccl_buffer_size_bytes() -> int:
+    raw = os.environ.get("HCCL_BUFFSIZE")
+    if raw is None or raw == "":
+        return CAM_FUSED_DEEP_MOE_DEFAULT_HCCL_BUFFSIZE_MB * CAM_FUSED_DEEP_MOE_MB_SIZE
+    try:
+        return int(raw) * CAM_FUSED_DEEP_MOE_MB_SIZE
+    except ValueError as exc:
+        raise ValueError(
+            f"HCCL_BUFFSIZE must be an integer number of megabytes, got {raw!r}."
+        ) from exc
+
+
+def _cam_op_argument_names(cam_op: Any) -> set[str]:
+    schema = getattr(cam_op, "_schema", None)
+    # torch.ops packets keep the schema on the default overload, not the packet.
+    if schema is None:
+        default_overload = getattr(cam_op, "default", None)
+        schema = getattr(default_overload, "_schema", None)
+    if schema is not None:
+        arguments = getattr(schema, "arguments", None)
+        if arguments:
+            return {getattr(argument, "name", str(argument)) for argument in arguments}
+    try:
+        names = set(inspect.signature(cam_op).parameters)
+    except (TypeError, ValueError):
+        return set()
+    # OpOverloadPacket.signature() is (*args, **kwargs); that is not the ABI.
+    if names <= {"args", "kwargs"}:
+        return set()
+    return names
+
+
+def load_cam_fused_deep_moe_op() -> Callable[..., Any]:
+    """Import the UMDK CAM wheel and return ``fused_deep_moe``.
+
+    Importing the wheel only registers ``torch.ops.umdk_cam_op_lib.fused_deep_moe``.
+    The operator itself is stateless: group/rank/world/global_bs are passed per
+    call, and this loader must not compile kernels or allocate persistent
+    communication resources.
+    """
+    import_module("umdk_cam_op_lib")
+    try:
+        cam_op = torch.ops.umdk_cam_op_lib.fused_deep_moe
+    except AttributeError as exc:
+        raise RuntimeError(
+            "umdk_cam_op_lib is installed but torch.ops.umdk_cam_op_lib.fused_deep_moe "
+            "is missing. Install a wheel that registers the CAM fused_deep_moe operator."
+        ) from exc
+    argument_names = _cam_op_argument_names(cam_op)
+    missing = [name for name in CAM_FUSED_DEEP_MOE_REQUIRED_ARGS if argument_names and name not in argument_names]
+    if missing:
+        raise RuntimeError(
+            "umdk_cam_op_lib.fused_deep_moe is missing required routed-only arguments "
+            f"{missing}."
+        )
+    return cam_op
+
+
+def validate_cam_fused_deep_moe_payload(
+    *,
+    w1: Sequence[torch.Tensor],
+    w2: Sequence[torch.Tensor],
+    w1_scale: Sequence[torch.Tensor],
+    w2_scale: Sequence[torch.Tensor],
+    w1_scale_bias: Sequence[torch.Tensor],
+    w2_scale_bias: Sequence[torch.Tensor],
+) -> None:
+    """Reject MegaMoe INT8-packed W4A8 weights and other incompatible payloads.
+
+    Dtypes are fixed after weight loading, so call this once when the CAM
+    payload is installed. ``_apply_cam_fused_deep_moe`` only re-runs it for
+    layers that skipped install (for example unit tests that pass lists
+    directly).
+    """
+    if not w1 or not w2 or not w1_scale or not w2_scale or not w1_scale_bias or not w2_scale_bias:
+        raise ValueError(
+            "CAM fused_deep_moe requires per-expert INT32-packed W4A8 weights plus "
+            "float scales and float32 bias lists. The MegaMoe INT8-packed payload "
+            "cannot be reused."
+        )
+    if len({len(w1), len(w2), len(w1_scale), len(w2_scale), len(w1_scale_bias), len(w2_scale_bias)}) != 1:
+        raise ValueError(
+            "CAM fused_deep_moe weight/scale/bias TensorLists must have the same "
+            f"length, got weights=({len(w1)}, {len(w2)}), scales=({len(w1_scale)}, "
+            f"{len(w2_scale)}), bias=({len(w1_scale_bias)}, {len(w2_scale_bias)})."
+        )
+    for name, tensors, expected_dtype in (
+        ("gmm1_weight", w1, torch.int32),
+        ("gmm2_weight", w2, torch.int32),
+        ("gmm1_bias", w1_scale_bias, torch.float32),
+        ("gmm2_bias", w2_scale_bias, torch.float32),
+    ):
+        for tensor in tensors:
+            if tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"CAM fused_deep_moe {name} must be {expected_dtype}, got {tensor.dtype}."
+                )
+    for name, tensors in (("gmm1_weight_scale", w1_scale), ("gmm2_weight_scale", w2_scale)):
+        for tensor in tensors:
+            if tensor.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+                raise ValueError(
+                    f"CAM fused_deep_moe {name} must be float32/bfloat16/float16, got {tensor.dtype}. "
+                    "Do not pass the MegaMoe or dispatch_ffn_combine INT64 packed scales."
+                )
+
+
+def validate_cam_fused_deep_moe_static_inputs(
+    *,
+    hidden_size: int,
+    num_experts: int,
+    ep_world_size: int,
+    global_bs: int,
+) -> None:
+    """Check expert / EP / AIV / HCCL limits that do not change every forward.
+
+    When ``global_bs == 0`` the HCCL demand uses the CAM max batch so a small
+    first step cannot skip a buffer that a later 256-token step would need.
+    """
+    if num_experts > CAM_FUSED_DEEP_MOE_MAX_EXPERTS:
+        raise ValueError(
+            f"CAM fused_deep_moe supports at most {CAM_FUSED_DEEP_MOE_MAX_EXPERTS} experts, "
+            f"got {num_experts}."
+        )
+    if ep_world_size <= 1:
+        raise ValueError("CAM fused_deep_moe requires expert parallel world size > 1.")
+    if num_experts % ep_world_size != 0:
+        raise ValueError(
+            f"CAM fused_deep_moe requires num_experts ({num_experts}) to be divisible by "
+            f"EP world size ({ep_world_size})."
+        )
+    local_experts = num_experts // ep_world_size
+    max_local_experts = _cam_aiv_num() // 2
+    if local_experts > max_local_experts:
+        raise ValueError(
+            "CAM fused_deep_moe requires local experts <= AIV/2 "
+            f"({max_local_experts}), got {local_experts}."
+        )
+    if global_bs < 0:
+        raise ValueError(f"CAM fused_deep_moe global_bs must be >= 0, got {global_bs}.")
+    if global_bs > 0 and global_bs % ep_world_size != 0:
+        raise ValueError(
+            f"CAM fused_deep_moe global_bs ({global_bs}) must be divisible by EP world size "
+            f"({ep_world_size})."
+        )
+    effective_global_bs = (
+        global_bs if global_bs > 0 else ep_world_size * CAM_FUSED_DEEP_MOE_MAX_BATCH_SIZE
+    )
+    buffer_demand = (
+        local_experts
+        * effective_global_bs
+        * hidden_size
+        * CAM_FUSED_DEEP_MOE_TOKEN_DTYPE_BYTES
+        * CAM_FUSED_DEEP_MOE_DOUBLE_BUFFER
+    )
+    hccl_buffer_bytes = _cam_hccl_buffer_size_bytes()
+    if buffer_demand > hccl_buffer_bytes:
+        needed_mb = (buffer_demand + CAM_FUSED_DEEP_MOE_MB_SIZE - 1) // CAM_FUSED_DEEP_MOE_MB_SIZE
+        have_mb = hccl_buffer_bytes // CAM_FUSED_DEEP_MOE_MB_SIZE
+        raise ValueError(
+            "CAM fused_deep_moe HCCL buffer is too small: "
+            f"need HCCL_BUFFSIZE>={needed_mb} MB, current HCCL_BUFFSIZE={have_mb} MB "
+            f"(local_experts={local_experts}, global_bs={effective_global_bs}, hidden={hidden_size})."
+        )
+
+
+def validate_cam_fused_deep_moe_shape_inputs(
+    *,
+    batch_size: int,
+    hidden_size: int,
+    gmm1_hidden: int,
+    top_k: int,
+) -> None:
+    """Check per-step CAM shapes that can change with padding or graph size."""
+    if batch_size > CAM_FUSED_DEEP_MOE_MAX_BATCH_SIZE:
+        raise ValueError(
+            f"CAM fused_deep_moe supports at most {CAM_FUSED_DEEP_MOE_MAX_BATCH_SIZE} tokens "
+            f"per rank, got {batch_size}. Reduce max_num_batched_tokens / graph capture size "
+            "or disable enable_cam_fused_deep_moe to fall back to dispatch_ffn_combine."
+        )
+    if hidden_size < CAM_FUSED_DEEP_MOE_MIN_HIDDEN or hidden_size > CAM_FUSED_DEEP_MOE_MAX_HIDDEN:
+        raise ValueError(
+            "CAM fused_deep_moe hidden size must be in "
+            f"[{CAM_FUSED_DEEP_MOE_MIN_HIDDEN}, {CAM_FUSED_DEEP_MOE_MAX_HIDDEN}], got {hidden_size}."
+        )
+    if gmm1_hidden < CAM_FUSED_DEEP_MOE_MIN_GMM1_HIDDEN or gmm1_hidden > CAM_FUSED_DEEP_MOE_MAX_GMM1_HIDDEN:
+        raise ValueError(
+            "CAM fused_deep_moe GMM1 hidden (2 * intermediate_size) must be in "
+            f"[{CAM_FUSED_DEEP_MOE_MIN_GMM1_HIDDEN}, {CAM_FUSED_DEEP_MOE_MAX_GMM1_HIDDEN}], "
+            f"got {gmm1_hidden}."
+        )
+    if top_k > CAM_FUSED_DEEP_MOE_MAX_TOPK:
+        raise ValueError(
+            f"CAM fused_deep_moe supports topK <= {CAM_FUSED_DEEP_MOE_MAX_TOPK}, got {top_k}."
+        )
+
+
+def validate_cam_fused_deep_moe_inputs(
+    *,
+    batch_size: int,
+    hidden_size: int,
+    gmm1_hidden: int,
+    top_k: int,
+    num_experts: int,
+    ep_world_size: int,
+    global_bs: int,
+) -> None:
+    """Raise an actionable error when a CAM host-side constraint is violated."""
+    validate_cam_fused_deep_moe_static_inputs(
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        ep_world_size=ep_world_size,
+        global_bs=global_bs,
+    )
+    validate_cam_fused_deep_moe_shape_inputs(
+        batch_size=batch_size,
+        hidden_size=hidden_size,
+        gmm1_hidden=gmm1_hidden,
+        top_k=top_k,
+    )
 
 
 def select_mega_moe_activation_kwargs(

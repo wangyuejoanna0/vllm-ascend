@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import regex as re
@@ -5,6 +6,7 @@ import torch
 
 from tests.ut.base import TestBase
 from tests.ut.quantization.conftest_quantization import identity
+from vllm_ascend.ops.fused_moe.moe_utils import CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR
 from vllm_ascend.quantization.methods.w4a8.w4a8 import AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD
 
@@ -235,6 +237,41 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertEqual(len(list_layer.w13_weight_list), self.experts)
         self.assertEqual(list_layer.w13_weight_list[0].dtype, torch.int8)
         self.assertTrue(all(weight.storage_offset() == 0 for weight in list_layer.w13_weight_list))
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_current_vllm_config")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cam_fused_deep_moe", new=lambda _: True)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cann_megamoe", new=lambda _: False)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.maybe_trans_nz")
+    @patch("torch.Tensor.npu", new=lambda self: self, create=True)
+    def test_process_weights_builds_cam_int32_payload(
+        self, mock_maybe_trans_nz, mock_get_ascend_config, mock_vllm_config
+    ):
+        mock_maybe_trans_nz.side_effect = identity
+        mock_get_ascend_config.return_value.enable_fused_mc2 = 1
+        mock_vllm_config.return_value = object()
+        layer = self.build_layer()
+        self.quant_method.process_weights_after_loading(layer)
+        self.assertEqual(layer.w13_weight.data.dtype, torch.int32)
+        self.assertEqual(len(layer.cam_fused_deep_moe_w13_weight_list), self.experts)
+        self.assertTrue(all(weight.dtype == torch.int32 for weight in layer.cam_fused_deep_moe_w13_weight_list))
+        self.assertTrue(all(weight.storage_offset() == 0 for weight in layer.cam_fused_deep_moe_w13_weight_list))
+        self.assertTrue(all(scale.dtype == torch.float32 for scale in layer.cam_fused_deep_moe_w13_weight_scale_list))
+        self.assertTrue(all(bias.dtype == torch.float32 for bias in layer.cam_fused_deep_moe_w13_scale_bias_list))
+        self.assertEqual(layer.w13_weight_scale.data.dtype, torch.int64)
+        self.assertTrue(getattr(layer, CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR, False))
+
+        cam_payload = self.quant_method.get_cam_fused_deep_moe_weights(layer)
+        self.assertIs(cam_payload.w1, layer.cam_fused_deep_moe_w13_weight_list)
+        self.assertIs(cam_payload.w1_scale, layer.cam_fused_deep_moe_w13_weight_scale_list)
+        self.assertNotEqual(cam_payload.w1_scale[0].dtype, torch.int64)
+
+        with patch(
+            "vllm_ascend.quantization.methods.w4a8.w4a8._EXTRA_CTX",
+            SimpleNamespace(use_cam_fused_deep_moe=True, use_mega_moe=False),
+        ):
+            fallback_payload = self.quant_method.get_fused_mc2_weights(layer)
+        self.assertEqual(fallback_payload.w1_scale[0].dtype, torch.int64)
 
     def test_pack_to_int32_asserts_packed_dim(self):
         weight = torch.zeros((self.experts, self.output_size, 10), dtype=torch.int8)
