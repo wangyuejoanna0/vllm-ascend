@@ -23,12 +23,37 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+import torch_npu  # noqa: F401  # registers torch.npu and compile backends
 
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.moe_comm_method import FusedMC2CommImpl
 from vllm_ascend.ops.fused_moe.moe_utils import load_cam_fused_deep_moe_op
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.quantization.quant_type import QuantType
+
+
+def _npu_graph_backend() -> str:
+    """Resolve the torch.compile backend registered by the current torch_npu stack.
+
+    ``npugraph`` is not a valid name. torchair (torch_npu 2.8) registers
+    ``npugraphs``; newer stacks register ``npugraph_ex``.
+    """
+    try:
+        import torchair  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import npugraph_ex  # noqa: F401
+    except ImportError:
+        pass
+    available = torch._dynamo.list_backends()
+    for name in ("npugraphs", "npugraph_ex"):
+        if name in available:
+            return name
+    raise RuntimeError(
+        "No NPU graph compile backend found. Tried npugraphs/npugraph_ex; "
+        f"available={available}"
+    )
 
 
 def main():
@@ -94,8 +119,17 @@ def main():
         probs = torch.rand(num_tokens, args.topk, device="npu", dtype=torch.float32)
         mask = None
         if args.with_mask:
+            # Uniform-mode padding (global_bs=0): trailing rows are pad, not
+            # routed tokens. CAM AIV still indexes GM from expert_ids on those
+            # rows, so leave placeholder ids / zeros instead of random experts.
+            num_pad = num_tokens // 2
             mask = torch.ones(num_tokens, device="npu", dtype=torch.bool)
-            mask[num_tokens // 2 :] = False
+            if num_pad:
+                mask[num_tokens - num_pad :] = False
+                x[num_tokens - num_pad :] = 0
+                ids[num_tokens - num_pad :] = torch.arange(args.topk, device="npu", dtype=torch.int32)
+                probs[num_tokens - num_pad :] = 0
+            mask = mask.contiguous()
         inp = build_fused_experts_input(
             hidden_states=x,
             topk_ids=ids,
@@ -107,11 +141,14 @@ def main():
         return comm._apply_cam_fused_deep_moe(inp, weights)
 
     for num_tokens in args.tokens:
-        out, expert_tokens = run_once(num_tokens)
+        runner = run_once
+        out, expert_tokens = runner(num_tokens)
+        torch.npu.synchronize()
         dist.barrier()
         if args.graph:
-            compiled = torch.compile(run_once, backend="npugraph")
-            out, expert_tokens = compiled(num_tokens)
+            runner = torch.compile(run_once, backend=_npu_graph_backend())
+            out, expert_tokens = runner(num_tokens)
+            torch.npu.synchronize()
         print(
             json.dumps(
                 {
@@ -126,7 +163,8 @@ def main():
             flush=True,
         )
         for _ in range(args.repeats):
-            run_once(num_tokens)
+            runner(num_tokens)
+            torch.npu.synchronize()
 
     dist.destroy_process_group()
 
