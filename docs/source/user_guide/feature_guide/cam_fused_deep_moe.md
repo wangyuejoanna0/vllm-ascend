@@ -61,8 +61,8 @@ Host-side checks raise a concrete error when any of these fail:
 | Local experts | `<= AIV/2` |
 | `global_bs` | `0` or divisible by EP |
 | Activations | float16/bfloat16 |
-| Weights | INT32-packed INT4, per-expert TensorList, NZ layout |
-| Scales / bias | float32 scales and float32 bias; not MegaMoe INT8-packed W4A8 |
+| Weights | INT32-packed INT4, per-expert TensorList, ND layout, `[K, N/8]` per expert. GMM1 keeps ModelSlim `[gate \| up]` order: the kernel pairs SwiGLU across the global N halves (`out[j] = silu(y[j]) * y[j + intermediate]`), so GMM1 N must not be permuted or half-swapped and GMM2 is not reordered |
+| Scales / bias | float32 scales indexed by the same global GMM1 column, and the A8W4 compensation matrix (`8 * sum_k(W_int4) * weight_scale`) as bias. The kernel adds bias to every dequantized tile, so zeros are not a valid bias |
 
 ## A3 multi-card validation
 

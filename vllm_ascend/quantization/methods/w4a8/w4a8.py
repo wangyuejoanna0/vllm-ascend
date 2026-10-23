@@ -389,6 +389,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         if data.dim() >= 2 and data.shape[0] == num_experts:
             return [expert.reshape(-1).to(torch.float32).clone() for expert in data.unbind(0)]
         if data.dim() == 1:
+            if num_experts != 1:
+                raise ValueError(
+                    f"CAM fused_deep_moe expected per-expert scales/bias with first dim {num_experts}, "
+                    f"got shape {tuple(data.shape)}"
+                )
             return [data.reshape(-1).to(torch.float32).clone()]
         raise ValueError(
             f"CAM fused_deep_moe expected per-expert scales/bias with first dim {num_experts}, "
@@ -402,18 +407,36 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w2_scale: torch.Tensor,
     ) -> None:
         # Weights are still packed INT8 ND after ModelSlim / compressed-tensors.
-        # Clone each expert in ND, NZ-cast INT8, then view INT32. clone() on
-        # FRACTAL_NZ and npu_format_cast on packed INT32 both fail on A3.
-        # contiguous() is a no-op on already-contiguous unbind views and would
-        # leave a nonzero storage_offset, which CAM TensorList rejects.
+        # The installed aclnnFusedDeepMoe prototype only accepts INT32 ND
+        # gmm1/gmm2 weights (FRACTAL_NZ is rejected). Clone each expert in ND
+        # so TensorList entries have storage_offset 0, then pack INT8->INT32.
+        #
+        # Do NOT permute or swap the GMM1 N axis. ``fused_deep_moe`` pairs
+        # SwiGLU across the *global* N halves, not per GEMM tile: the epilogue
+        # uses ``isLeft = blockOffset.column() < layoutD.shape(1) / 2``
+        # (block_epilogue_per_token_dequant_swiglu.h) and the quant pass reads
+        # the partner at ``gmTileInput[layoutInput.shape(1) / 2]``
+        # (grouped_matmul_slice_m_per_token_dequant_swiglu_quant_*.h), i.e.
+        # ``out[j] = silu(y[j]) * y[j + intermediate]`` for a GMM1 output of
+        # ``2 * intermediate`` channels. ModelSlim already stores ``[gate | up]``
+        # and ``process_weights_after_loading_*`` leaves it that way, so the
+        # natural order is the required order. Scales and scale_bias are indexed
+        # by the same global column and must stay in that order too.
+        #
+        # ``*_scale_bias`` is the A8W4 asymmetric compensation matrix, not a
+        # zero bias: the kernel adds it to every dequantized tile
+        # (``C = (C_high * 16 + C_low + bias) * x_scale``), and
+        # ``process_weights_after_loading_*`` already materializes it as
+        # ``8 * sum_k(W_int4) * weight_scale``. Forwarding zeros corrupts every
+        # expert output.
         w13 = layer.w13_weight.data
         w2 = layer.w2_weight.data
         num_experts = w13.shape[0]
         layer.cam_fused_deep_moe_w13_weight_list = [
-            self._pack_int8_nz_to_int32(maybe_trans_nz(weight.clone())) for weight in w13.unbind(0)
+            self._pack_to_int32(weight.clone()) for weight in w13.unbind(0)
         ]
         layer.cam_fused_deep_moe_w2_weight_list = [
-            self._pack_int8_nz_to_int32(maybe_trans_nz(weight.clone())) for weight in w2.unbind(0)
+            self._pack_to_int32(weight.clone()) for weight in w2.unbind(0)
         ]
         layer.cam_fused_deep_moe_w13_weight_scale_list = self._cam_per_expert_float_list(
             w13_scale, num_experts
