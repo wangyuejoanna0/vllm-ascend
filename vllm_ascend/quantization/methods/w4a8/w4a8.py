@@ -356,6 +356,18 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         return weight.view(torch.int32).contiguous()
 
+    def _pack_int8_nz_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
+        """Reinterpret INT8 FRACTAL_NZ as INT32 without launching TransData.
+
+        W4A8 NZ tiling is INT8. ``npu_format_cast`` / ``contiguous()`` on the
+        packed INT32 view launches Identity/TransData and fails on A3 with
+        vector-core MTE invalid GM address.
+        """
+        assert weight.shape[-1] % 4 == 0, (
+            f"the last dim of weight needs to be divided by 4 but got shape {weight.shape}"
+        )
+        return weight.view(torch.int32)
+
     @staticmethod
     def _as_cam_float_scale(scale: torch.Tensor) -> torch.Tensor:
         """Capture unpacked W4A8 scales as float32 before INT64 packing."""
@@ -389,21 +401,19 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w13_scale: torch.Tensor,
         w2_scale: torch.Tensor,
     ) -> None:
-        packed_w13 = self._pack_to_int32(layer.w13_weight.data)
-        packed_w2 = self._pack_to_int32(layer.w2_weight.data)
-        layer.w13_weight.data = packed_w13
-        layer.w2_weight.data = packed_w2
-        num_experts = packed_w13.shape[0]
-        # Clone per-expert slices while weights are still ND, then NZ-cast the
-        # independent tensors. clone() on FRACTAL_NZ launches Identity/TransData
-        # and fails on A3 with "stream is not registered with any allocator".
+        # Weights are still packed INT8 ND after ModelSlim / compressed-tensors.
+        # Clone each expert in ND, NZ-cast INT8, then view INT32. clone() on
+        # FRACTAL_NZ and npu_format_cast on packed INT32 both fail on A3.
         # contiguous() is a no-op on already-contiguous unbind views and would
         # leave a nonzero storage_offset, which CAM TensorList rejects.
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        num_experts = w13.shape[0]
         layer.cam_fused_deep_moe_w13_weight_list = [
-            maybe_trans_nz(weight.clone()) for weight in packed_w13.unbind(0)
+            self._pack_int8_nz_to_int32(maybe_trans_nz(weight.clone())) for weight in w13.unbind(0)
         ]
         layer.cam_fused_deep_moe_w2_weight_list = [
-            maybe_trans_nz(weight.clone()) for weight in packed_w2.unbind(0)
+            self._pack_int8_nz_to_int32(maybe_trans_nz(weight.clone())) for weight in w2.unbind(0)
         ]
         layer.cam_fused_deep_moe_w13_weight_scale_list = self._cam_per_expert_float_list(
             w13_scale, num_experts
@@ -469,12 +479,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         if use_cam:
             assert cam_w13_scale is not None and cam_w2_scale is not None
-            # Pack/split the CAM TensorList before NZ conversion. See
-            # _install_cam_fused_deep_moe_payload for why clone() cannot run on
-            # FRACTAL_NZ tensors.
             self._install_cam_fused_deep_moe_payload(layer, cam_w13_scale, cam_w2_scale)
-            layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
-            layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+            # Stacked fallback for dispatch_ffn_combine: NZ-cast INT8, then view
+            # INT32. Do not npu_format_cast packed INT32; TransData cannot tile it.
+            layer.w13_weight.data = self._pack_int8_nz_to_int32(maybe_trans_nz(layer.w13_weight.data))
+            layer.w2_weight.data = self._pack_int8_nz_to_int32(maybe_trans_nz(layer.w2_weight.data))
             return
         layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
         layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)

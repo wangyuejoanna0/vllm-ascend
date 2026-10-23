@@ -256,8 +256,9 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertEqual(len(layer.cam_fused_deep_moe_w13_weight_list), self.experts)
         self.assertTrue(all(weight.dtype == torch.int32 for weight in layer.cam_fused_deep_moe_w13_weight_list))
         self.assertTrue(all(weight.storage_offset() == 0 for weight in layer.cam_fused_deep_moe_w13_weight_list))
-        # Stacked fallback weights plus each cloned expert tensor are NZ-cast
-        # after ND clone. Cloning FRACTAL_NZ tensors is what fails on A3.
+        # NZ-cast INT8 clones (per expert) plus stacked INT8 fallback weights.
+        # TransData cannot NZ-cast packed INT32, and clone() of FRACTAL_NZ fails
+        # on A3, so packing is a view after the INT8 cast.
         self.assertGreaterEqual(mock_maybe_trans_nz.call_count, 2 + 2 * self.experts)
         self.assertTrue(all(scale.dtype == torch.float32 for scale in layer.cam_fused_deep_moe_w13_weight_scale_list))
         self.assertTrue(all(bias.dtype == torch.float32 for bias in layer.cam_fused_deep_moe_w13_scale_bias_list))
