@@ -394,10 +394,17 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w13_weight.data = packed_w13
         layer.w2_weight.data = packed_w2
         num_experts = packed_w13.shape[0]
-        # clone() so each TensorList entry has storage_offset 0. contiguous() is
-        # a no-op on already-contiguous unbind views and leaves a nonzero offset.
-        layer.cam_fused_deep_moe_w13_weight_list = [weight.clone() for weight in packed_w13.unbind(0)]
-        layer.cam_fused_deep_moe_w2_weight_list = [weight.clone() for weight in packed_w2.unbind(0)]
+        # Clone per-expert slices while weights are still ND, then NZ-cast the
+        # independent tensors. clone() on FRACTAL_NZ launches Identity/TransData
+        # and fails on A3 with "stream is not registered with any allocator".
+        # contiguous() is a no-op on already-contiguous unbind views and would
+        # leave a nonzero storage_offset, which CAM TensorList rejects.
+        layer.cam_fused_deep_moe_w13_weight_list = [
+            maybe_trans_nz(weight.clone()) for weight in packed_w13.unbind(0)
+        ]
+        layer.cam_fused_deep_moe_w2_weight_list = [
+            maybe_trans_nz(weight.clone()) for weight in packed_w2.unbind(0)
+        ]
         layer.cam_fused_deep_moe_w13_weight_scale_list = self._cam_per_expert_float_list(
             w13_scale, num_experts
         )
@@ -452,8 +459,6 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             self.process_weights_after_loading_compressed_tensors(layer)
         else:
             self.process_weights_after_loading_modelslim(layer)
-        layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
-        layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
         tensor_names = (
             "w13_weight",
             "w2_weight",
@@ -464,8 +469,15 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         if use_cam:
             assert cam_w13_scale is not None and cam_w2_scale is not None
+            # Pack/split the CAM TensorList before NZ conversion. See
+            # _install_cam_fused_deep_moe_payload for why clone() cannot run on
+            # FRACTAL_NZ tensors.
             self._install_cam_fused_deep_moe_payload(layer, cam_w13_scale, cam_w2_scale)
+            layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+            layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
             return
+        layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+        layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
         use_mega_moe = use_cann_megamoe(vllm_config)
         if self.use_expert_weight_list:
             for tensor_name in tensor_names:
