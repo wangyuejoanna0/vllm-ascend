@@ -61,6 +61,13 @@ _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod]
 _MOE_DEBUG_DUMP_DIR = os.environ.get("VLLM_ASCEND_MOE_DEBUG_DUMP", "").strip()
 _MOE_DEBUG_MAX_LAYERS = int(os.environ.get("VLLM_ASCEND_MOE_DEBUG_MAX_LAYERS", "1"))
 _MOE_DEBUG_COUNTS: dict[str, int] = {}
+if _MOE_DEBUG_DUMP_DIR:
+    logger.warning(
+        "MoE debug dumps enabled: dir=%s max_layers=%d pid=%d",
+        _MOE_DEBUG_DUMP_DIR,
+        _MOE_DEBUG_MAX_LAYERS,
+        os.getpid(),
+    )
 
 
 def _moe_debug_rank() -> int:
@@ -795,6 +802,20 @@ class FusedMC2CommImpl(MoECommMethod):
         if self.enable_fused_mc2 == 1:
             cam_selected = bool(getattr(_EXTRA_CTX, "use_cam_fused_deep_moe", False))
             use_cam = cam_selected and self.cam_fused_deep_moe is not None
+            if _MOE_DEBUG_DUMP_DIR:
+                logger.warning_once(
+                    "MoE debug: dir=%s enable_fused_mc2=%s cam_selected=%s cam_op_loaded=%s "
+                    "use_mega_moe=%s quant_type=%s -> branch=%s",
+                    _MOE_DEBUG_DUMP_DIR,
+                    self.enable_fused_mc2,
+                    cam_selected,
+                    self.cam_fused_deep_moe is not None,
+                    bool(getattr(_EXTRA_CTX, "use_mega_moe", False)),
+                    fused_experts_input.quant.quant_type,
+                    "cam"
+                    if (use_cam and fused_experts_input.quant.quant_type == QuantType.W4A8)
+                    else ("mega_moe" if (getattr(_EXTRA_CTX, "use_mega_moe", False) and not cam_selected) else "dfc"),
+                )
             if use_cam and fused_experts_input.quant.quant_type == QuantType.W4A8:
                 get_cam_weights = getattr(quant_method, "get_cam_fused_deep_moe_weights", None)
                 if get_cam_weights is None:
@@ -822,6 +843,25 @@ class FusedMC2CommImpl(MoECommMethod):
                 )
 
                 out = torch.empty_like(fused_experts_input.hidden_states)
+                _moe_debug_dump(
+                    "dfc_in",
+                    {
+                        "x": fused_experts_input.hidden_states,
+                        "expert_ids": fused_experts_input.topk_ids,
+                        "expert_scales": fused_experts_input.topk_weights,
+                        "x_active_mask": fused_experts_input.routing.mc2_mask,
+                        "global_bs": int(self.token_dispatcher.global_bs),
+                        "ep_world_size": int(self.token_dispatcher.ep_world_size),
+                        "ep_rank_id": int(self.token_dispatcher.ep_rank_id),
+                        "quant_type": str(fused_experts_input.quant.quant_type),
+                        "w1": weights.w1,
+                        "w1_scale": weights.w1_scale,
+                        "w1_scale_bias": weights.w1_scale_bias,
+                        "w2": weights.w2,
+                        "w2_scale": weights.w2_scale,
+                        "w2_scale_bias": weights.w2_scale_bias,
+                    },
+                )
                 torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
                     x=fused_experts_input.hidden_states,
                     weight1=weights.w1,
@@ -841,6 +881,13 @@ class FusedMC2CommImpl(MoECommMethod):
                     expert_token_nums=self.expert_token_nums,
                 )
                 expert_tokens = self.expert_token_nums
+                _moe_debug_dump(
+                    "dfc_out",
+                    {
+                        "out": out,
+                        "expert_tokens": expert_tokens,
+                    },
+                )
         else:
             raise ValueError(f"Wrong value of {self.enable_fused_mc2=}")
         return FusedExpertsResult(
