@@ -15,9 +15,10 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
@@ -50,6 +51,54 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod] = {}
+
+# ---------------------------------------------------------------------------
+# TEMPORARY debug instrumentation for the CAM fused_deep_moe investigation.
+# Enable with VLLM_ASCEND_MOE_DEBUG_DUMP=/tmp/moe_dump; unset means zero
+# overhead. Each path writes one .pt per EP rank per layer so the MegaMoe and
+# CAM runs can be compared token-for-token offline. Remove before merging.
+# ---------------------------------------------------------------------------
+_MOE_DEBUG_DUMP_DIR = os.environ.get("VLLM_ASCEND_MOE_DEBUG_DUMP", "").strip()
+_MOE_DEBUG_MAX_LAYERS = int(os.environ.get("VLLM_ASCEND_MOE_DEBUG_MAX_LAYERS", "1"))
+_MOE_DEBUG_COUNTS: dict[str, int] = {}
+
+
+def _moe_debug_rank() -> int:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+    return int(os.environ.get("RANK", "-1"))
+
+
+def _moe_debug_cpu(value: Any) -> Any:
+    """Convert tensors (and shallow containers of them) to CPU copies."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").clone()
+    if isinstance(value, (list, tuple)):
+        return [_moe_debug_cpu(item) for item in value]
+    return value
+
+
+def _moe_debug_dump(tag: str, payload: dict[str, Any]) -> None:
+    """Save one snapshot of a fused MoE call for offline A/B comparison."""
+    if not _MOE_DEBUG_DUMP_DIR:
+        return
+    index = _MOE_DEBUG_COUNTS.get(tag, 0)
+    if index >= _MOE_DEBUG_MAX_LAYERS:
+        return
+    _MOE_DEBUG_COUNTS[tag] = index + 1
+    try:
+        os.makedirs(_MOE_DEBUG_DUMP_DIR, exist_ok=True)
+        path = os.path.join(_MOE_DEBUG_DUMP_DIR, f"{tag}_layer{index}_rank{_moe_debug_rank()}.pt")
+        torch.save({key: _moe_debug_cpu(value) for key, value in payload.items()}, path)
+        logger.warning("MoE debug dump written: %s", path)
+    except Exception as exc:  # noqa: BLE001 - never break the forward pass
+        logger.warning("MoE debug dump failed for %s: %s", tag, exc)
+
 
 
 def _moe_config_key(
@@ -552,6 +601,26 @@ class FusedMC2CommImpl(MoECommMethod):
         activation_kwargs = getattr(layer, "mega_moe_activation_kwargs", None)
         if activation_kwargs is None:
             activation_kwargs = getattr(self, "mega_moe_activation_kwargs", {}) or {}
+        _moe_debug_dump(
+            "mega_in",
+            {
+                "x": fused_experts_input.hidden_states,
+                "expert_ids": fused_experts_input.topk_ids,
+                "expert_scales": fused_experts_input.topk_weights,
+                "x_active_mask": x_active_mask,
+                "global_bs": int(self.token_dispatcher.global_bs),
+                "ep_world_size": int(self.token_dispatcher.ep_world_size),
+                "ep_rank_id": int(self.token_dispatcher.ep_rank_id),
+                "quant_type": str(fused_experts_input.quant.quant_type),
+                "weight_type": weight_type,
+                "w1": weight1,
+                "w1_scale": weights.w1_scale,
+                "w1_scale_bias": l1_bias,
+                "w2": weight2,
+                "w2_scale": weights.w2_scale,
+                "w2_scale_bias": l2_bias,
+            },
+        )
         out, expert_tokens = self.mega_moe(
             fused_experts_input.hidden_states,
             fused_experts_input.topk_ids.to(torch.int32),
@@ -573,6 +642,13 @@ class FusedMC2CommImpl(MoECommMethod):
         # pre-allocated in/out buffer. The MegaMoe op returns a fresh
         # expert_tokens tensor that is consumed by the caller via the
         # return value, so there is nothing to keep on the instance.
+        _moe_debug_dump(
+            "mega_out",
+            {
+                "out": out,
+                "expert_tokens": expert_tokens,
+            },
+        )
         return out, expert_tokens
 
     def _apply_cam_fused_deep_moe(
@@ -644,6 +720,25 @@ class FusedMC2CommImpl(MoECommMethod):
             raw_mask = fused_experts_input.routing.mc2_mask
             x_active_mask = raw_mask if raw_mask.dtype == torch.bool else raw_mask.to(torch.bool)
 
+        _moe_debug_dump(
+            "cam_in",
+            {
+                "x": hidden_states,
+                "expert_ids": fused_experts_input.topk_ids,
+                "expert_scales": fused_experts_input.topk_weights,
+                "x_active_mask": x_active_mask,
+                "global_bs": global_bs,
+                "ep_world_size": ep_world_size,
+                "ep_rank_id": int(self.token_dispatcher.ep_rank_id),
+                "quant_type": str(fused_experts_input.quant.quant_type),
+                "w1": w1,
+                "w1_scale": w1_scale,
+                "w1_scale_bias": w1_scale_bias,
+                "w2": w2,
+                "w2_scale": w2_scale,
+                "w2_scale_bias": w2_scale_bias,
+            },
+        )
         output, _share_output, expert_tokens = self.cam_fused_deep_moe(
             x=hidden_states,
             expert_ids=fused_experts_input.topk_ids.to(torch.int32),
@@ -669,6 +764,14 @@ class FusedMC2CommImpl(MoECommMethod):
             moe_expert_num=int(self.moe_config.num_experts),
             quant_mode=moe_utils.CAM_FUSED_DEEP_MOE_QUANT_MODE,
             global_bs=global_bs,
+        )
+        _moe_debug_dump(
+            "cam_out",
+            {
+                "out": output,
+                "share_out": _share_output,
+                "expert_tokens": expert_tokens,
+            },
         )
         return output, expert_tokens
 
