@@ -191,6 +191,7 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
             self.quant_method.get_eplb_weight_views(layer)
 
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_current_vllm_config", new=lambda: None)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cam_fused_deep_moe", new=lambda _: False)
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cann_megamoe", new=lambda _: False)
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.maybe_trans_nz")
@@ -216,6 +217,7 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertIs(weight_views[-1], list_layer.w2_scale_bias_list)
 
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_current_vllm_config", new=lambda: None)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cam_fused_deep_moe", new=lambda _: False)
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cann_megamoe", new=lambda _: False)
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.maybe_trans_nz")
