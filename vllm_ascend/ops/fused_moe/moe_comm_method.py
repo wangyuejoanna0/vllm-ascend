@@ -62,12 +62,15 @@ _MOE_DEBUG_DUMP_DIR = os.environ.get("VLLM_ASCEND_MOE_DEBUG_DUMP", "").strip()
 _MOE_DEBUG_MAX_LAYERS = int(os.environ.get("VLLM_ASCEND_MOE_DEBUG_MAX_LAYERS", "1"))
 _MOE_DEBUG_COUNTS: dict[str, int] = {}
 if _MOE_DEBUG_DUMP_DIR:
-    logger.warning(
-        "MoE debug dumps enabled: dir=%s max_layers=%d pid=%d",
-        _MOE_DEBUG_DUMP_DIR,
-        _MOE_DEBUG_MAX_LAYERS,
-        os.getpid(),
-    )
+    # vLLM installs its log handlers after module import, so a log line here is
+    # usually dropped. Leave a marker file instead: it proves both that this
+    # code is loaded and that the env reached the worker process.
+    try:
+        os.makedirs(_MOE_DEBUG_DUMP_DIR, exist_ok=True)
+        with open(os.path.join(_MOE_DEBUG_DUMP_DIR, f"_import_pid{os.getpid()}.txt"), "w") as _marker:
+            _marker.write(f"dir={_MOE_DEBUG_DUMP_DIR}\nmax_layers={_MOE_DEBUG_MAX_LAYERS}\npid={os.getpid()}\n")
+    except OSError:
+        pass
 
 
 def _moe_debug_rank() -> int:
