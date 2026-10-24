@@ -454,14 +454,16 @@ def select_mega_moe_activation_kwargs(
     """Build activation kwargs compatible with the installed MegaMoe wrapper.
 
     MiniMax-M3 uses SwiGLU-OAI (``alpha=1.702``, ``beta=1.0``). Older MegaMoe
-    builds only expose ``activation_clamp`` for standard SwiGLU, while newer
-    wrappers expose either ``activation``/``activation_params`` or direct
-    alpha/beta keyword arguments. Standard SwiGLU keeps the legacy call.
+    builds only expose ``activation_clamp`` for standard SwiGLU, while CANN 9.2
+    and later require a non-null ``activation`` name (``swiglu`` for silu).
+    Newer wrappers also expose ``activation``/``activation_params`` or direct
+    alpha/beta keyword arguments for SwiGLU-OAI and SiTU.
     """
     kwargs: dict[str, object] = {"activation_clamp": activation_clamp}
     activation_name = getattr(activation, "value", activation)
     is_situ = activation_name == "situ"
-    if not is_situ and activation_name not in ("swigluoai", "swigluoai_uninterleave"):
+    is_standard_swiglu = activation_name in ("silu", "swiglu")
+    if not is_situ and not is_standard_swiglu and activation_name not in ("swigluoai", "swigluoai_uninterleave"):
         return kwargs
 
     activation_parameter_pairs = (
@@ -511,6 +513,13 @@ def select_mega_moe_activation_kwargs(
         if situ_linear_beta is not None:
             params["linear_beta"] = situ_linear_beta
         return {"activation": "situglu", "activation_params": params}
+    if is_standard_swiglu:
+        # CANN 9.2 aclnnMegaMoe rejects a null activation. Pass the kernel
+        # name when the wrapper accepts it; keep clamp-only for closed
+        # legacy signatures.
+        if "activation" in parameter_names or accepts_kwargs:
+            kwargs["activation"] = "swiglu"
+        return kwargs
     if {"activation", "activation_params"}.issubset(parameter_names):
         kwargs.update(
             activation="swigluoai",

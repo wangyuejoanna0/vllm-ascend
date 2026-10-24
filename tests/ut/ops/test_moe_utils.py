@@ -163,8 +163,6 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
             return activation_clamp
 
         for activation in (
-            "silu",
-            "swiglu",
             "gelu",
             "gelu_tanh",
             "relu",
@@ -173,7 +171,6 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
             "swiglustep",
             "legacy_custom",
             None,
-            MoEActivation.SILU,
             MoEActivation.GELU,
             MoEActivation.RELU2,
         ):
@@ -208,7 +205,22 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
         )
         self.assertEqual(kwargs, {"activation_clamp": 7.0, "swiglu_alpha": 1.702, "swiglu_beta": 1.0})
 
-    def test_select_mega_moe_activation_kwargs_keeps_clamp_only_for_legacy_op(self):
+    def test_select_mega_moe_activation_kwargs_binds_swiglu_for_silu(self):
+        def mega_moe(*args, activation="swiglu", activation_clamp=None, activation_params=None, **kwargs):
+            return args, activation, activation_clamp, activation_params, kwargs
+
+        for activation in ("silu", "swiglu", MoEActivation.SILU):
+            with self.subTest(activation=activation):
+                kwargs = select_mega_moe_activation_kwargs(
+                    mega_moe,
+                    activation=activation,
+                    activation_clamp=7.0,
+                    swiglu_alpha=1.702,
+                    swiglu_beta=1.0,
+                )
+                self.assertEqual(kwargs, {"activation": "swiglu", "activation_clamp": 7.0})
+
+    def test_select_mega_moe_activation_kwargs_binds_swiglu_for_kwargs_wrapper(self):
         def mega_moe(*args, activation_clamp=None, **kwargs):
             return args, activation_clamp, kwargs
 
@@ -219,7 +231,21 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
         )
+        self.assertEqual(kwargs, {"activation": "swiglu", "activation_clamp": 7.0})
+
+    def test_select_mega_moe_activation_kwargs_keeps_clamp_only_for_legacy_silu(self):
+        def mega_moe(*args, activation_clamp=None):
+            return args, activation_clamp
+
+        kwargs = select_mega_moe_activation_kwargs(
+            mega_moe,
+            activation="silu",
+            activation_clamp=7.0,
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
+        )
         self.assertEqual(kwargs, {"activation_clamp": 7.0})
+        self.assertEqual(mega_moe(**kwargs), ((), 7.0))
 
     def test_select_mega_moe_activation_kwargs_binds_oai_when_supported(self):
         def mega_moe(*args, activation_clamp=None, glu_alpha=1.0, glu_bias=0.0, **kwargs):
