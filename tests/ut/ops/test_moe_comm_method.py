@@ -495,3 +495,30 @@ class TestMoECommMethod(TestBase):
             hidden_states=mock_apply_mlp.return_value[0],
             combine_metadata=mock_td_instance.token_dispatch.return_value.combine_metadata,
         )
+
+
+class TestMoeDebugCpu(TestBase):
+    def test_cpu_tensor_is_cloned(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _moe_debug_cpu
+
+        tensor = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+        copied = _moe_debug_cpu(tensor)
+        self.assertTrue(torch.equal(copied, tensor))
+        self.assertFalse(copied.data_ptr() == tensor.data_ptr())
+
+    def test_nested_list_is_copied(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _moe_debug_cpu
+
+        tensors = [torch.ones(2, dtype=torch.int32), torch.zeros(3, dtype=torch.int32)]
+        copied = _moe_debug_cpu(tensors)
+        self.assertEqual(len(copied), 2)
+        self.assertTrue(torch.equal(copied[0], tensors[0]))
+        self.assertTrue(torch.equal(copied[1], tensors[1]))
+
+    def test_storage_copy_keeps_int32_bits(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _copy_tensor_storage_to_cpu
+
+        tensor = torch.tensor([[0x12345678, -1], [7, 0x0A0B0C0D]], dtype=torch.int32)
+        copied = _copy_tensor_storage_to_cpu(tensor)
+        self.assertEqual(copied.device.type, "cpu")
+        self.assertTrue(torch.equal(copied, tensor))

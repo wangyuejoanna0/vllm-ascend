@@ -49,6 +49,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
 
 _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod] = {}
 
@@ -84,10 +85,45 @@ def _moe_debug_rank() -> int:
     return int(os.environ.get("RANK", "-1"))
 
 
+_ND_OR_UNDEFINED_FORMATS = {None, 0, ACL_FORMAT_FRACTAL_ND}
+
+
+def _copy_tensor_storage_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Memcpy tensor storage to CPU without Identity / TransData.
+
+    ``tensor.to("cpu")`` on FRACTAL_NZ packed INT32 launches TransData, which
+    cannot tile that layout (GE Identity 500002). Copy the raw bytes, then
+    restore the logical view so offline compare still sees the same shape.
+    """
+    storage = tensor.untyped_storage()
+    nbytes = storage.nbytes()
+    if nbytes == 0:
+        return torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
+    device_bytes = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+    device_bytes.set_(storage, 0, (nbytes,))
+    cpu_bytes = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+    cpu_bytes.copy_(device_bytes)
+    cpu = torch.empty(0, dtype=tensor.dtype, device="cpu")
+    cpu.set_(cpu_bytes.untyped_storage(), tensor.storage_offset(), tensor.size(), tensor.stride())
+    return cpu.clone()
+
+
 def _moe_debug_cpu(value: Any) -> Any:
     """Convert tensors (and shallow containers of them) to CPU copies."""
     if isinstance(value, torch.Tensor):
-        return value.detach().to("cpu").clone()
+        tensor = value.detach()
+        if tensor.device.type != "npu":
+            return tensor.clone()
+        fmt = None
+        try:
+            import torch_npu
+
+            fmt = int(torch_npu.get_npu_format(tensor))
+        except Exception:  # noqa: BLE001 - dump must never break the forward
+            fmt = None
+        if fmt in _ND_OR_UNDEFINED_FORMATS:
+            return tensor.to("cpu").clone()
+        return _copy_tensor_storage_to_cpu(tensor)
     if isinstance(value, (list, tuple)):
         return [_moe_debug_cpu(item) for item in value]
     return value
