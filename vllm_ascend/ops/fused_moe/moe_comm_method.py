@@ -84,8 +84,15 @@ def _moe_debug_cpu(value: Any) -> Any:
 
 
 def _moe_debug_dump(tag: str, payload: dict[str, Any]) -> None:
-    """Save one snapshot of a fused MoE call for offline A/B comparison."""
+    """Save one snapshot of a fused MoE call for offline A/B comparison.
+
+    ``profile_run`` executes the model with dummy tokens before serving, so its
+    fused-MoE calls must not consume the layer budget: the dumps are meant to
+    capture the first real request, and both runs must see the same one.
+    """
     if not _MOE_DEBUG_DUMP_DIR:
+        return
+    if getattr(_EXTRA_CTX, "in_profile_run", False):
         return
     index = _MOE_DEBUG_COUNTS.get(tag, 0)
     if index >= _MOE_DEBUG_MAX_LAYERS:
