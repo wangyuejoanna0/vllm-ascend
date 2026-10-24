@@ -20,9 +20,13 @@ must receive byte-identical input. This sends a single greedy request, waits
 for the server to be ready first, and optionally saves the response.
 
 Usage:
-    python tools/send_moe_debug_request.py --port 8000
-    python tools/send_moe_debug_request.py --port 8000 --save /tmp/cam_response.json
-    python tools/send_moe_debug_request.py --port 8000 --completions
+    python tools/moe_debug/send_moe_debug_request.py --port 8000
+    python tools/moe_debug/send_moe_debug_request.py --port 8000 --save /tmp/cam_response.json
+    python tools/moe_debug/send_moe_debug_request.py --port 8000 --completions
+
+Keep these scripts in a subdirectory: Python puts the script's own directory on
+sys.path, and a sibling ``bisect`` package under tools/ shadows the stdlib
+module, breaking any script that imports ``random``.
 """
 
 from __future__ import annotations
@@ -40,17 +44,31 @@ DEFAULT_PROMPT = "1+1 等于几？只回答数字。"
 DEFAULT_SYSTEM = "You are a helpful assistant."
 
 
+# Deployments behind an HTTP proxy (common on NPU hosts) would otherwise send
+# localhost requests to the proxy, which hangs until the socket times out. This
+# mirrors `curl --noproxy '*'` and keeps the request on the loopback interface.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def wait_for_server(base: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
+    attempt = 0
+    last_error = "no attempt yet"
     while time.monotonic() < deadline:
+        attempt += 1
         try:
-            with urllib.request.urlopen(f"{base}/health", timeout=5) as response:
+            with _OPENER.open(f"{base}/health", timeout=10) as response:
                 if response.status == 200:
+                    print(f"server is ready (after {attempt} probe(s))")
                     return
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            pass
+                last_error = f"HTTP {response.status}"
+        except urllib.error.HTTPError as exc:
+            last_error = f"HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            last_error = str(getattr(exc, "reason", exc))
+        print(f"  waiting for {base}/health (attempt {attempt}): {last_error}", flush=True)
         time.sleep(5)
-    raise SystemExit(f"server at {base} did not become healthy within {timeout:.0f}s")
+    raise SystemExit(f"server at {base} did not become healthy within {timeout:.0f}s; last probe: {last_error}")
 
 
 def post_json(url: str, payload: dict) -> dict:
@@ -61,10 +79,13 @@ def post_json(url: str, payload: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with _OPENER.open(request, timeout=600) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:  # surface the server's message
         raise SystemExit(f"HTTP {exc.code} from {url}: {exc.read().decode(errors='replace')}") from exc
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise SystemExit(f"cannot reach {url}: {reason}\nIs the server listening on that host/port?") from exc
 
 
 def main() -> int:
@@ -108,8 +129,8 @@ def main() -> int:
             "seed": 1024,
         }
 
-    print(f"POST {url}")
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"POST {url}", flush=True)
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     response = post_json(url, payload)
 
     if args.save:
