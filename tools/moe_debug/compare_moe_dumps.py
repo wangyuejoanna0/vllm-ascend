@@ -14,8 +14,9 @@
 # This file is a part of the vllm-ascend project.
 """Offline A/B comparison of VLLM_ASCEND_MOE_DEBUG_DUMP snapshots.
 
-Compares a MegaMoe run (reference) against a CAM fused_deep_moe run (candidate)
-on the same prompt. Checks, in order:
+Compares a reference fused-MoE run (MegaMoe ``mega_*`` or DFC ``dfc_*``)
+against a CAM fused_deep_moe run (``cam_*``) on the same prompt. Checks,
+in order:
 
   1. the fused-MoE inputs are identical (x / expert_ids / expert_scales /
      mask / global_bs), so any difference must come from the operator;
@@ -24,9 +25,10 @@ on the same prompt. Checks, in order:
   3. output statistics and a fitted global scale factor.
 
 Usage:
-    python compare_moe_dumps.py /tmp/dump_mega /tmp/dump_cam
-    python compare_moe_dumps.py /tmp/dump_mega /tmp/dump_cam --rank 3 --layer 0
-    python compare_moe_dumps.py /tmp/dump_mega /tmp/dump_cam --no-weights
+    python tools/moe_debug/compare_moe_dumps.py /tmp/dump_dfc /tmp/dump_cam
+    python tools/moe_debug/compare_moe_dumps.py /tmp/dump_mega /tmp/dump_cam
+    python tools/moe_debug/compare_moe_dumps.py /tmp/dump_dfc /tmp/dump_cam --rank 3 --layer 0
+    python tools/moe_debug/compare_moe_dumps.py /tmp/dump_dfc /tmp/dump_cam --no-weights
 
 Needs torch on CPU only; run it anywhere the dump files are visible.
 """
@@ -43,6 +45,18 @@ from typing import Any, Callable
 import torch
 
 NAME_RE = re.compile(r"^(?P<tag>.+)_layer(?P<layer>\d+)_rank(?P<rank>-?\d+)\.pt$")
+REF_IN_TAGS = ("dfc_in", "mega_in")
+REF_OUT_TAGS = ("dfc_out", "mega_out")
+CAM_IN_TAG = "cam_in"
+CAM_OUT_TAG = "cam_out"
+
+
+def first_tag(files: dict[tuple[str, int, int], str], tags: tuple[str, ...], layer: int, rank: int) -> tuple[str, str] | None:
+    for tag in tags:
+        path = files.get((tag, layer, rank))
+        if path is not None:
+            return tag, path
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -313,7 +327,7 @@ def compare_outputs(
 # --------------------------------------------------------------------------- #
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mega_dir", help="dump directory from the MegaMoe run")
+    parser.add_argument("ref_dir", help="dump directory from the DFC or MegaMoe reference run")
     parser.add_argument("cam_dir", help="dump directory from the CAM run")
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--rank", type=int, default=None, help="EP rank to inspect (default: first shared rank)")
@@ -322,14 +336,14 @@ def main() -> int:
     parser.add_argument("--no-weights", action="store_true", help="skip the weight layout comparison")
     args = parser.parse_args()
 
-    mega_files = discover(args.mega_dir)
+    ref_files = discover(args.ref_dir)
     cam_files = discover(args.cam_dir)
-    if not mega_files or not cam_files:
-        print(f"no dumps found (mega={len(mega_files)}, cam={len(cam_files)} files)", file=sys.stderr)
+    if not ref_files or not cam_files:
+        print(f"no dumps found (ref={len(ref_files)}, cam={len(cam_files)} files)", file=sys.stderr)
         print("did you set VLLM_ASCEND_MOE_DEBUG_DUMP before starting the server?", file=sys.stderr)
         return 1
 
-    ranks = sorted({rank for _, _, rank in mega_files} & {rank for _, _, rank in cam_files})
+    ranks = sorted({rank for _, _, rank in ref_files} & {rank for _, _, rank in cam_files})
     if not ranks:
         print("the two dump directories have no rank in common", file=sys.stderr)
         return 1
@@ -338,27 +352,33 @@ def main() -> int:
         print(f"rank {rank} not in both dumps (shared: {ranks})", file=sys.stderr)
         return 1
 
-    print(f"mega: {args.mega_dir} ({len(mega_files)} files)")
-    print(f"cam : {args.cam_dir} ({len(cam_files)} files)")
+    print(f"ref: {args.ref_dir} ({len(ref_files)} files)")
+    print(f"cam: {args.cam_dir} ({len(cam_files)} files)")
     print(f"shared ranks: {ranks}; inspecting rank {rank}, layer {args.layer}\n")
 
-    mega_in = mega_files.get(("mega_in", args.layer, rank))
-    cam_in = cam_files.get(("cam_in", args.layer, rank))
-    if mega_in is None or cam_in is None:
-        print("missing input dumps for that layer/rank", file=sys.stderr)
+    ref_in = first_tag(ref_files, REF_IN_TAGS, args.layer, rank)
+    cam_in = cam_files.get((CAM_IN_TAG, args.layer, rank))
+    if ref_in is None or cam_in is None:
+        print(
+            "missing input dumps for that layer/rank "
+            f"(ref tags tried: {REF_IN_TAGS}; cam tag: {CAM_IN_TAG})",
+            file=sys.stderr,
+        )
         return 1
 
-    mega = load(mega_in)
+    ref_tag, ref_in_path = ref_in
+    print(f"reference tag: {ref_tag}")
+    ref = load(ref_in_path)
     cam = load(cam_in)
 
-    compare_inputs(mega, cam)
+    compare_inputs(ref, cam)
     if not args.no_weights:
-        compare_weights(mega, cam, args.experts, args.rows)
+        compare_weights(ref, cam, args.experts, args.rows)
 
-    mega_out_path = mega_files.get(("mega_out", args.layer, rank))
-    cam_out_path = cam_files.get(("cam_out", args.layer, rank))
-    if mega_out_path and cam_out_path:
-        compare_outputs(load(mega_out_path), load(cam_out_path), args.layer, rank)
+    ref_out = first_tag(ref_files, REF_OUT_TAGS, args.layer, rank)
+    cam_out_path = cam_files.get((CAM_OUT_TAG, args.layer, rank))
+    if ref_out and cam_out_path:
+        compare_outputs(load(ref_out[1]), load(cam_out_path), args.layer, rank)
     else:
         print("\n[3] output dumps missing; only inputs were compared")
 
