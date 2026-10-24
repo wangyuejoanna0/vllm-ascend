@@ -93,29 +93,53 @@ def to_bool_mask(mask: Any) -> torch.Tensor | None:
 # --------------------------------------------------------------------------- #
 # 1. input equality
 # --------------------------------------------------------------------------- #
-def compare_inputs(mega: dict[str, Any], cam: dict[str, Any]) -> bool:
+def _align_rows(lhs: torch.Tensor, rhs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, str]:
+    """Trim a leading-token mismatch so prefill vs decode dumps can still be compared."""
+    if lhs.shape == rhs.shape:
+        return lhs, rhs, "full"
+    if lhs.shape[1:] == rhs.shape[1:] and lhs.dim() >= 1:
+        take = min(lhs.shape[0], rhs.shape[0])
+        return lhs[:take], rhs[:take], f"first {take} of {lhs.shape[0]} vs {rhs.shape[0]} tokens"
+    return lhs, rhs, "unaligned"
+
+
+def compare_inputs(ref: dict[str, Any], cam: dict[str, Any]) -> bool:
     print("[1] fused-MoE inputs")
     ok = True
+    token_note = None
 
     for key in ("x", "expert_ids", "expert_scales"):
-        lhs, rhs = mega.get(key), cam.get(key)
+        lhs, rhs = ref.get(key), cam.get(key)
         if lhs is None or rhs is None:
-            print(f"    {key:16s} missing (mega={lhs is not None}, cam={rhs is not None})")
+            print(f"    {key:16s} missing (ref={lhs is not None}, cam={rhs is not None})")
             ok = False
             continue
-        same = lhs.shape == rhs.shape and torch.equal(lhs.to(torch.float64), rhs.to(torch.float64))
-        print(f"    {key:16s} shape {tuple(lhs.shape)} vs {tuple(rhs.shape)}  identical={same}")
+        aligned_lhs, aligned_rhs, how = _align_rows(lhs, rhs)
+        if how != "full":
+            token_note = how
+        if aligned_lhs.shape != aligned_rhs.shape:
+            print(f"    {key:16s} shape {tuple(lhs.shape)} vs {tuple(rhs.shape)}  identical=False")
+            ok = False
+            continue
+        same = torch.equal(aligned_lhs.to(torch.float64), aligned_rhs.to(torch.float64))
+        suffix = "" if how == "full" else f"  aligned={how}"
+        print(
+            f"    {key:16s} shape {tuple(lhs.shape)} vs {tuple(rhs.shape)}  "
+            f"identical={same}{suffix}"
+        )
         ok &= same
 
-    mega_mask = to_bool_mask(mega.get("x_active_mask"))
+    ref_mask = to_bool_mask(ref.get("x_active_mask"))
     cam_mask = to_bool_mask(cam.get("x_active_mask"))
-    if mega_mask is None and cam_mask is None:
+    if ref_mask is None and cam_mask is None:
         print("    x_active_mask    both None")
-    elif mega_mask is not None and cam_mask is not None:
-        same = mega_mask.shape == cam_mask.shape and torch.equal(mega_mask, cam_mask)
+    elif ref_mask is not None and cam_mask is not None:
+        aligned_lhs, aligned_rhs, how = _align_rows(ref_mask, cam_mask)
+        same = aligned_lhs.shape == aligned_rhs.shape and torch.equal(aligned_lhs, aligned_rhs)
         print(
-            f"    x_active_mask    dtype {mega.get('x_active_mask').dtype} vs "
-            f"{cam.get('x_active_mask').dtype}, active {int(mega_mask.sum())}/{int(cam_mask.sum())}  identical={same}"
+            f"    x_active_mask    dtype {ref.get('x_active_mask').dtype} vs "
+            f"{cam.get('x_active_mask').dtype}, active {int(ref_mask.sum())}/{int(cam_mask.sum())}  "
+            f"identical={same}"
         )
         ok &= same
     else:
@@ -123,12 +147,19 @@ def compare_inputs(mega: dict[str, Any], cam: dict[str, Any]) -> bool:
         ok = False
 
     for key in ("global_bs", "ep_world_size", "ep_rank_id"):
-        lhs, rhs = mega.get(key), cam.get(key)
+        lhs, rhs = ref.get(key), cam.get(key)
         same = lhs == rhs
         print(f"    {key:16s} {lhs} vs {rhs}  identical={same}")
         ok &= same
 
-    print(f"    => inputs {'MATCH (difference is inside the operator)' if ok else 'DIFFER (look upstream of MoE)'}")
+    if token_note is not None:
+        print(
+            f"    note: dumps captured different token counts ({token_note}); "
+            "this is usually prefill vs first decode, not an upstream MoE bug."
+        )
+    print(
+        f"    => inputs {'MATCH (difference is inside the operator)' if ok else 'DIFFER on the aligned slice'}"
+    )
     return ok
 
 
@@ -156,15 +187,23 @@ def unpack_int32_int4(t: torch.Tensor) -> torch.Tensor:
     return torch.cat(parts, dim=-1).reshape(*t.shape[:-1], -1)
 
 
+def as_expert_list(value: Any) -> list[torch.Tensor]:
+    """DFC dumps stacked ``[E, K, N]``; CAM dumps a Python list of per-expert ``[K, N]``."""
+    items = [item for item in as_list(value) if isinstance(item, torch.Tensor)]
+    if len(items) == 1 and items[0].dim() >= 3:
+        return list(items[0].unbind(0))
+    return items
+
+
 def nz_to_nd(weight: torch.Tensor) -> torch.Tensor | None:
     """Best-effort FRACTAL_NZ -> ND, matching ``convert_nd_to_nz`` in the sample.
 
     The sample builds NZ with ``reshape(..., K//16, 16, N//n0, n0)`` followed by
-    ``permute(*lead, -2, -4, -3, -1)``, so a per-expert tensor is laid out as
-    ``[K_blk, N_blk, 16, n0]`` — block row is K, block column is N, and inside a
-    fractal the 16 axis is K and ``n0`` is N (n0 = 32 for INT8, 8 for INT32).
+    ``permute(*lead, -2, -4, -3, -1)``, so a 5-D per-expert tensor is laid out as
+    ``[K_blk, N_blk, 16, n0]``. Packed INT32 dumps from ``_moe_debug_cpu`` keep
+    the logical 2-D ``[K, N_packed]`` view (or stacked 3-D ``[E, K, N_packed]``).
     """
-    if weight.dim() == 3:
+    if weight.dim() in (2, 3):
         return weight
     if weight.dim() != 5:
         return None
@@ -203,51 +242,54 @@ def match_transform(lhs: torch.Tensor, rhs: torch.Tensor) -> str:
 
 
 def compare_weights(
-    mega: dict[str, Any], cam: dict[str, Any], experts: list[int], rows: int
+    ref: dict[str, Any], cam: dict[str, Any], experts: list[int], rows: int
 ) -> None:
     print("\n[2] GMM1 weight layout")
-    mega_w1 = as_list(mega.get("w1"))
-    cam_w1 = as_list(cam.get("w1"))
-    if not mega_w1 or not cam_w1:
+    ref_w1 = as_expert_list(ref.get("w1"))
+    cam_w1 = as_expert_list(cam.get("w1"))
+    if not ref_w1 or not cam_w1:
         print("    skipped: dump has no w1")
         return
     print(
-        f"    carriers: mega {mega_w1[0].dtype} {tuple(mega_w1[0].shape)}"
-        f"  |  cam {cam_w1[0].dtype} {tuple(cam_w1[0].shape)}"
+        f"    carriers: ref {ref_w1[0].dtype} {tuple(ref_w1[0].shape)} x{len(ref_w1)}"
+        f"  |  cam {cam_w1[0].dtype} {tuple(cam_w1[0].shape)} x{len(cam_w1)}"
     )
 
     for expert in experts:
-        if expert >= len(mega_w1) or expert >= len(cam_w1):
+        if expert >= len(ref_w1) or expert >= len(cam_w1):
             print(f"    expert {expert}: not present in both dumps")
             continue
-        mega_nd = nz_to_nd(mega_w1[expert])
+        ref_nd = nz_to_nd(ref_w1[expert])
         cam_nd = nz_to_nd(cam_w1[expert])
-        if mega_nd is None or cam_nd is None:
-            print(f"    expert {expert}: unknown NZ layout, skipped")
+        if ref_nd is None or cam_nd is None:
+            print(
+                f"    expert {expert}: unknown NZ layout, "
+                f"ref dim={ref_w1[expert].dim()} cam dim={cam_w1[expert].dim()}"
+            )
             continue
-        if mega_nd.dtype == torch.int8:
-            mega_int4 = unpack_int8_int4(mega_nd)
+        if ref_nd.dtype == torch.int8:
+            ref_int4 = unpack_int8_int4(ref_nd)
         else:
-            mega_int4 = unpack_int32_int4(mega_nd)
+            ref_int4 = unpack_int32_int4(ref_nd)
         cam_int4 = cam_nd if cam_nd.dtype == torch.int8 else unpack_int32_int4(cam_nd)
 
-        if mega_int4.shape[-1] != cam_int4.shape[-1]:
+        if ref_int4.shape[-1] != cam_int4.shape[-1]:
             print(
-                f"    expert {expert}: N mismatch after unpack, mega {mega_int4.shape[-1]} vs "
+                f"    expert {expert}: N mismatch after unpack, ref {ref_int4.shape[-1]} vs "
                 f"cam {cam_int4.shape[-1]}"
             )
             continue
 
-        take = min(rows, mega_int4.shape[0])
-        lhs = mega_int4[:take]
+        take = min(rows, ref_int4.shape[0], cam_int4.shape[0])
+        lhs = ref_int4[:take]
         rhs = cam_int4[:take]
         equal_elems = int((lhs == rhs).sum())
         total = lhs.numel()
         relation = match_transform(lhs, rhs)
         print(
-            f"    expert {expert}: K={mega_int4.shape[0]} N={mega_int4.shape[-1]}, "
+            f"    expert {expert}: K={ref_int4.shape[0]} N={ref_int4.shape[-1]}, "
             f"first {take} rows identical={equal_elems}/{total} ({100.0 * equal_elems / total:.1f}%), "
-            f"cam == {relation}(mega)"
+            f"cam == {relation}(ref)"
         )
 
     print("    interpretation: 'identity' means both paths were given the same INT4 weights;")
@@ -279,24 +321,32 @@ def describe(tag: str, out: torch.Tensor, mask: torch.Tensor | None) -> dict[str
 
 
 def compare_outputs(
-    mega: dict[str, Any], cam: dict[str, Any], layer: int, rank: int
+    ref: dict[str, Any], cam: dict[str, Any], layer: int, rank: int
 ) -> None:
     print(f"\n[3] fused-MoE output (layer {layer}, rank {rank})")
-    mega_out = mega.get("out")
+    ref_out = ref.get("out")
     cam_out = cam.get("out")
-    if mega_out is None or cam_out is None:
+    if ref_out is None or cam_out is None:
         print("    skipped: dump has no output tensor")
         return
-    if mega_out.shape != cam_out.shape:
-        print(f"    SHAPE MISMATCH: mega {tuple(mega_out.shape)} vs cam {tuple(cam_out.shape)}")
+    lhs, rhs, how = _align_rows(ref_out, cam_out)
+    if lhs.shape != rhs.shape:
+        print(f"    SHAPE MISMATCH: ref {tuple(ref_out.shape)} vs cam {tuple(cam_out.shape)}")
         return
+    if how != "full":
+        print(
+            f"    aligned {how}; comparing the overlapping token rows only "
+            f"(ref {tuple(ref_out.shape)} vs cam {tuple(cam_out.shape)})"
+        )
 
-    mask = to_bool_mask(mega.get("x_active_mask"))
-    describe("mega_out", mega_out, mask)
-    describe("cam_out", cam_out, mask)
+    mask = to_bool_mask(ref.get("x_active_mask"))
+    if mask is not None and mask.numel() != lhs.shape[0]:
+        mask = mask[: lhs.shape[0]]
+    describe("ref_out", lhs, mask)
+    describe("cam_out", rhs, mask)
 
-    lhs = mega_out.to(torch.float32)
-    rhs = cam_out.to(torch.float32)
+    lhs = lhs.to(torch.float32)
+    rhs = rhs.to(torch.float32)
     if mask is not None and mask.numel() == lhs.shape[0]:
         lhs, rhs = lhs[mask], rhs[mask]
     if lhs.numel() == 0:
@@ -310,14 +360,14 @@ def compare_outputs(
     cosine = torch.nn.functional.cosine_similarity(lhs.flatten(), rhs.flatten(), dim=0)
     rel = float((lhs_flat - rhs_flat).norm()) / float(lhs_flat.norm().clamp_min(1e-12))
 
-    print(f"    fitted cam ~= {alpha:.6g} * mega")
+    print(f"    fitted cam ~= {alpha:.6g} * ref")
     print(f"    relative error after removing that factor: {residual:.4f}")
     print(f"    relative error as-is: {rel:.4f}   cosine similarity: {float(cosine):.6f}")
 
     if residual < 0.05 and abs(alpha - 1.0) > 0.05:
         print("    => CAM output is a scaled copy: suspect a dequant / compensation-matrix factor.")
     elif residual < 0.05:
-        print("    => CAM matches MegaMoe within quantization noise.")
+        print("    => CAM matches the reference within quantization noise.")
     elif float(cosine) < 0.5:
         print("    => CAM output is uncorrelated with the reference: suspect weight order or routing.")
     else:
