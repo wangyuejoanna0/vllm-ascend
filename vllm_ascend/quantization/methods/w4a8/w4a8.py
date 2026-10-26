@@ -452,34 +452,33 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w2_scale: torch.Tensor,
     ) -> None:
         # Official FusionOp (fused_deep_moe_sample_w4A8.py):
-        #   1. GMM1 N axis is ``[up | gate]``. Kernel SwiGLU is
-        #      ``silu(left) * right`` with ``act_left=true``. ModelSlim / this
-        #      loader keep ``[gate | up]`` on ``layer.w13_*`` for DFC, so only
-        #      the CAM copies are half-swapped. w2 is not swapped.
+        #   1. SwiGLU is ``silu(left) * right`` (sample names left ``act``).
+        #      ModelSlim / vLLM store ``[gate | up]`` and also do
+        #      ``silu(left) * right``. Do not half-swap GMM1; that would
+        #      compute ``silu(up) * gate``.
         #   2. Pack INT8 ND -> INT32 ND, then ``convert_nd_to_nz`` (INT32
         #      fractal 16x8, reshape back to ``[K, N]``). Host rejects a
         #      FRACTAL_NZ *tag*; it still consumes NZ *storage*.
         #   3. ``*_scale_bias`` is the A8W4 assist matrix
         #      ``8 * sum_k(W_int4) * weight_scale``, not a zero bias.
-        # Clone after the ND swap so TensorList storage_offset is 0.
+        # Clone so TensorList storage_offset is 0.
         w13 = layer.w13_weight.data
         w2 = layer.w2_weight.data
         num_experts = w13.shape[0]
-        w13_up_gate = self._swap_last_dim_halves(w13)
         layer.cam_fused_deep_moe_w13_weight_list = [
-            self._convert_nd_to_nz(self._pack_to_int32(weight.clone())) for weight in w13_up_gate.unbind(0)
+            self._convert_nd_to_nz(self._pack_to_int32(weight.clone())) for weight in w13.unbind(0)
         ]
         layer.cam_fused_deep_moe_w2_weight_list = [
             self._convert_nd_to_nz(self._pack_to_int32(weight.clone())) for weight in w2.unbind(0)
         ]
         layer.cam_fused_deep_moe_w13_weight_scale_list = self._cam_per_expert_float_list(
-            self._swap_last_dim_halves(w13_scale), num_experts
+            w13_scale, num_experts
         )
         layer.cam_fused_deep_moe_w2_weight_scale_list = self._cam_per_expert_float_list(
             w2_scale, num_experts
         )
         layer.cam_fused_deep_moe_w13_scale_bias_list = self._cam_per_expert_float_list(
-            self._swap_last_dim_halves(layer.w13_scale_bias.data), num_experts
+            layer.w13_scale_bias.data, num_experts
         )
         layer.cam_fused_deep_moe_w2_scale_bias_list = self._cam_per_expert_float_list(
             layer.w2_scale_bias.data, num_experts

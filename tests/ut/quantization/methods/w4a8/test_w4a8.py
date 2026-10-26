@@ -340,14 +340,13 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.maybe_trans_nz")
     @patch("torch.Tensor.npu", new=lambda self: self, create=True)
-    def test_cam_payload_swaps_to_up_then_gate_and_nz(
+    def test_cam_payload_keeps_gate_then_up_and_nz(
         self, mock_maybe_trans_nz, mock_get_ascend_config, mock_vllm_config
     ):
-        """Official CAM SwiGLU is ``silu(up) * gate`` on the global N halves.
+        """Official CAM and ModelSlim SwiGLU are both ``silu(left) * right``.
 
-        ModelSlim stores ``[gate | up]`` for DFC. The CAM copies must be
-        half-swapped to ``[up | gate]``, then INT32-packed and NZ-shuffled
-        without changing the logical ``[K, N]`` shape.
+        Keep ModelSlim ``[gate | up]`` on the CAM copies; only INT32-pack and
+        NZ-shuffle. Half-swapping would compute ``silu(up) * gate``.
         """
         mock_maybe_trans_nz.side_effect = identity
         mock_get_ascend_config.return_value.enable_fused_mc2 = 1
@@ -370,27 +369,25 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertFalse(torch.equal(cam_w13_nz, _cam_int32_nz_to_nd(cam_w13_nz)))
         cam_w13 = _cam_int32_nz_to_nd(cam_w13_nz).view(torch.int8)
         self.assertEqual(cam_w13.shape, (hidden, intermediate))
-        expected_w13 = torch.tensor([2] * gate_packed + [1] * gate_packed, dtype=torch.int8)
+        expected_w13 = torch.tensor([1] * gate_packed + [2] * gate_packed, dtype=torch.int8)
         self.assertTrue(torch.equal(cam_w13, expected_w13.expand_as(cam_w13)))
         cam_scale = layer.cam_fused_deep_moe_w13_weight_scale_list[0]
-        self.assertTrue(torch.equal(cam_scale, torch.tensor([4.0] * intermediate + [3.0] * intermediate)))
+        self.assertTrue(torch.equal(cam_scale, torch.tensor([3.0] * intermediate + [4.0] * intermediate)))
         cam_bias = layer.cam_fused_deep_moe_w13_scale_bias_list[0]
-        self.assertTrue(torch.equal(cam_bias, torch.tensor([6.0] * intermediate + [5.0] * intermediate)))
-        # DFC stacked weights stay ModelSlim [gate|up]; only CAM copies swap.
+        self.assertTrue(torch.equal(cam_bias, torch.tensor([5.0] * intermediate + [6.0] * intermediate)))
         dfc_w13 = layer.w13_weight.data.view(torch.int8)
-        expected_dfc = torch.tensor([1] * gate_packed + [2] * gate_packed, dtype=torch.int8)
-        self.assertTrue(torch.equal(dfc_w13[0], expected_dfc.expand_as(dfc_w13[0])))
+        self.assertTrue(torch.equal(dfc_w13[0], expected_w13.expand_as(dfc_w13[0])))
         for w13_bias in layer.cam_fused_deep_moe_w13_scale_bias_list:
             self.assertEqual(w13_bias.numel(), 2 * intermediate)
             self.assertTrue(torch.count_nonzero(w13_bias) > 0)
         for w2_bias in layer.cam_fused_deep_moe_w2_scale_bias_list:
             self.assertTrue(torch.count_nonzero(w2_bias) > 0)
 
-    def test_cam_gmm1_payload_uses_official_swap_and_nz(self):
-        """CAM install must follow the official sample: half-swap then ND->NZ."""
+    def test_cam_gmm1_payload_uses_official_nz_without_swap(self):
+        """CAM install must NZ-shuffle INT32 and must not half-swap GMM1."""
         payload_source = inspect.getsource(AscendW4A8DynamicFusedMoEMethod._install_cam_fused_deep_moe_payload)
-        self.assertIn("_swap_last_dim_halves", payload_source)
         self.assertIn("_convert_nd_to_nz", payload_source)
+        self.assertNotIn("_swap_last_dim_halves", payload_source)
         self.assertNotIn("maybe_trans_nz", payload_source)
         self.assertNotIn("npu_format_cast", payload_source)
 
