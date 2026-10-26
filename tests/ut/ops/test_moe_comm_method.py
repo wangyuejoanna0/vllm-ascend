@@ -522,3 +522,34 @@ class TestMoeDebugCpu(TestBase):
         copied = _copy_tensor_storage_to_cpu(tensor)
         self.assertEqual(copied.device.type, "cpu")
         self.assertTrue(torch.equal(copied, tensor))
+
+
+class TestSanitizeCamInactiveRows(TestBase):
+    def test_inactive_rows_are_zeroed_and_ids_rewritten(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _sanitize_cam_inactive_rows
+
+        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        expert_ids = torch.tensor([[255, 254], [253, 252], [251, 250]], dtype=torch.int32)
+        expert_scales = torch.tensor([[0.5, 0.5], [0.4, 0.6], [0.3, 0.7]])
+        mask = torch.tensor([True, False, False])
+
+        x, ids, scales = _sanitize_cam_inactive_rows(hidden, expert_ids, expert_scales, mask)
+
+        self.assertTrue(torch.equal(x[0], hidden[0]))
+        self.assertTrue(torch.equal(ids[0], expert_ids[0]))
+        self.assertTrue(torch.equal(scales[0], expert_scales[0]))
+        self.assertTrue(torch.equal(x[1:], torch.zeros(2, 2)))
+        self.assertTrue(torch.equal(ids[1:], torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)))
+        self.assertTrue(torch.equal(scales[1:], torch.zeros(2, 2)))
+        self.assertTrue(torch.equal(hidden[1], torch.tensor([3.0, 4.0])))
+
+    def test_none_mask_is_a_no_op(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _sanitize_cam_inactive_rows
+
+        hidden = torch.ones(2, 3)
+        expert_ids = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+        expert_scales = torch.ones(2, 4)
+        x, ids, scales = _sanitize_cam_inactive_rows(hidden, expert_ids, expert_scales, None)
+        self.assertIs(x, hidden)
+        self.assertIs(ids, expert_ids)
+        self.assertIs(scales, expert_scales)

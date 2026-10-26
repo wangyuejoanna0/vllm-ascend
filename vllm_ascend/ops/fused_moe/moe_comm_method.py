@@ -129,6 +129,34 @@ def _moe_debug_cpu(value: Any) -> Any:
     return value
 
 
+def _sanitize_cam_inactive_rows(
+    hidden_states: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_scales: torch.Tensor,
+    x_active_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zero padded rows before ``fused_deep_moe``.
+
+    With ``global_bs=0``, CAM AIV still indexes GM from ``expert_ids`` on
+    masked-off rows. Rank 15 dumps show ``active 0/0`` but keep the routed
+    ids ``255..248``; the kernel then runs those pad rows as real tokens and
+    pollutes dispatch/combine. Mirror the e2e placeholder: x=0, scales=0,
+    ids=``[0, 1, ..., top_k)``.
+    """
+    if x_active_mask is None:
+        return hidden_states, expert_ids, expert_scales
+    mask = x_active_mask if x_active_mask.dtype == torch.bool else x_active_mask.to(torch.bool)
+    top_k = expert_ids.shape[-1]
+    mask_x = mask.to(dtype=hidden_states.dtype).unsqueeze(-1)
+    mask_s = mask.to(dtype=expert_scales.dtype).unsqueeze(-1)
+    placeholder = torch.arange(top_k, device=expert_ids.device, dtype=expert_ids.dtype)
+    return (
+        hidden_states * mask_x,
+        torch.where(mask.unsqueeze(-1), expert_ids, placeholder),
+        expert_scales * mask_s,
+    )
+
+
 def _moe_debug_dump(tag: str, payload: dict[str, Any]) -> None:
     """Save one snapshot of a fused MoE call for offline A/B comparison.
 
@@ -792,14 +820,20 @@ class FusedMC2CommImpl(MoECommMethod):
                 "w2_scale_bias": w2_scale_bias,
             },
         )
+        hidden_states, expert_ids, expert_scales = _sanitize_cam_inactive_rows(
+            hidden_states,
+            fused_experts_input.topk_ids.to(torch.int32),
+            fused_experts_input.topk_weights.to(torch.float32),
+            x_active_mask,
+        )
         output, _share_output, expert_tokens = self.cam_fused_deep_moe(
             x=hidden_states,
-            expert_ids=fused_experts_input.topk_ids.to(torch.int32),
+            expert_ids=expert_ids,
             gmm1_weight=w1,
             gmm1_weight_scale=w1_scale,
             gmm2_weight=w2,
             gmm2_weight_scale=w2_scale,
-            expert_scales=fused_experts_input.topk_weights.to(torch.float32),
+            expert_scales=expert_scales,
             share_gmm1_weight=None,
             share_gmm1_weight_scale=None,
             share_gmm2_weight=None,
