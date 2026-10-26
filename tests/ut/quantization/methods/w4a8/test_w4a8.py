@@ -8,8 +8,34 @@ import torch
 from tests.ut.base import TestBase
 from tests.ut.quantization.conftest_quantization import identity
 from vllm_ascend.ops.fused_moe.moe_utils import CAM_FUSED_DEEP_MOE_PAYLOAD_VALIDATED_ATTR
-from vllm_ascend.quantization.methods.w4a8.w4a8 import AscendW4A8DynamicFusedMoEMethod
+from vllm_ascend.quantization.methods.w4a8.w4a8 import (
+    _CAM_INT32_NZ_COL_FRACTAL,
+    _CAM_INT32_NZ_ROW_FRACTAL,
+    AscendW4A8DynamicFusedMoEMethod,
+)
 from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD
+
+# Official INT32 NZ fractal is (16, 8). After ModelSlim transpose + INT32 pack:
+# GMM1 is [H, I/4], GMM2 is [I, H/8]. Need H%16==0, I%32==0, H%64==0.
+# I>=64 and H>=128 so N/8>1 and the NZ shuffle is not a no-op.
+_CAM_TEST_INTERMEDIATE = 64
+_CAM_TEST_HIDDEN = 128
+
+
+def _cam_int32_nz_to_nd(weight: torch.Tensor) -> torch.Tensor:
+    """Inverse of official ``convert_nd_to_nz`` for a 2-D or 3-D INT32 carrier."""
+    row_fractal, col_fractal = _CAM_INT32_NZ_ROW_FRACTAL, _CAM_INT32_NZ_COL_FRACTAL
+    *leading_dims, rows, cols = weight.shape
+    viewed = weight.reshape(
+        *leading_dims,
+        cols // col_fractal,
+        rows // row_fractal,
+        row_fractal,
+        col_fractal,
+    )
+    lead = len(leading_dims)
+    nd = viewed.permute(*range(lead), lead + 1, lead + 2, lead, lead + 3)
+    return nd.reshape(*leading_dims, rows, cols).contiguous()
 
 
 class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
@@ -135,6 +161,31 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         )
         return layer
 
+    def build_cam_layer(self, intermediate: int = _CAM_TEST_INTERMEDIATE, hidden: int = _CAM_TEST_HIDDEN):
+        """ModelSlim W4A8 shapes that satisfy CAM INT32 NZ alignment."""
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(
+            torch.zeros((self.experts, intermediate, hidden), dtype=torch.int8), requires_grad=False
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.zeros((self.experts, hidden // 2, intermediate), dtype=torch.int8),
+            requires_grad=False,
+        )
+        layer.w13_scale_bias = torch.nn.Parameter(
+            torch.zeros((self.experts, 2 * intermediate, 1), dtype=torch.float32), requires_grad=False
+        )
+        layer.w2_scale_bias = torch.nn.Parameter(
+            torch.zeros((self.experts, hidden, 16 // self.quant_method.tp_size), dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones((self.experts, 2 * intermediate, 1), dtype=torch.float32), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones((self.experts, hidden, 1), dtype=torch.float32), requires_grad=False
+        )
+        return layer
+
     def build_layer_compressed_tensors(self):
         layer = torch.nn.Module()
         layer.w13_weight = torch.nn.Parameter(
@@ -253,14 +304,18 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         mock_maybe_trans_nz.side_effect = identity
         mock_get_ascend_config.return_value.enable_fused_mc2 = 1
         mock_vllm_config.return_value = object()
-        layer = self.build_layer()
+        layer = self.build_cam_layer()
         self.quant_method.process_weights_after_loading(layer)
         self.assertEqual(layer.w13_weight.data.dtype, torch.int32)
         self.assertEqual(len(layer.cam_fused_deep_moe_w13_weight_list), self.experts)
         self.assertTrue(all(weight.dtype == torch.int32 for weight in layer.cam_fused_deep_moe_w13_weight_list))
         self.assertTrue(all(weight.storage_offset() == 0 for weight in layer.cam_fused_deep_moe_w13_weight_list))
-        # CAM TensorList stays INT32 ND (operator OpDef rejects FRACTAL_NZ).
-        # Only stacked fallback weights are NZ-cast for dispatch_ffn_combine.
+        self.assertEqual(
+            layer.cam_fused_deep_moe_w13_weight_list[0].shape,
+            (_CAM_TEST_HIDDEN, _CAM_TEST_INTERMEDIATE // 4),
+        )
+        # CAM TensorList keeps the ND format tag (OpDef rejects FRACTAL_NZ).
+        # Only stacked fallback weights are npu_format_cast for DFC.
         self.assertGreaterEqual(mock_maybe_trans_nz.call_count, 2)
         self.assertTrue(all(scale.dtype == torch.float32 for scale in layer.cam_fused_deep_moe_w13_weight_scale_list))
         self.assertTrue(all(bias.dtype == torch.float32 for bias in layer.cam_fused_deep_moe_w13_scale_bias_list))
@@ -285,58 +340,59 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.maybe_trans_nz")
     @patch("torch.Tensor.npu", new=lambda self: self, create=True)
-    def test_cam_payload_keeps_gate_then_up_n_order(
+    def test_cam_payload_swaps_to_up_then_gate_and_nz(
         self, mock_maybe_trans_nz, mock_get_ascend_config, mock_vllm_config
     ):
-        """fused_deep_moe pairs SwiGLU across the global N halves.
+        """Official CAM SwiGLU is ``silu(up) * gate`` on the global N halves.
 
-        The epilogue splits at ``layoutD.shape(1) // 2`` and the quant pass
-        multiplies column ``j`` by column ``j + N/2``, so GMM1 must stay in
-        ModelSlim ``[gate | up]`` order: no half swap, no per-tile interleave.
+        ModelSlim stores ``[gate | up]`` for DFC. The CAM copies must be
+        half-swapped to ``[up | gate]``, then INT32-packed and NZ-shuffled
+        without changing the logical ``[K, N]`` shape.
         """
         mock_maybe_trans_nz.side_effect = identity
         mock_get_ascend_config.return_value.enable_fused_mc2 = 1
         mock_vllm_config.return_value = object()
-        # input_size is GMM1 N (packed INT8, two INT4 per byte) and
-        # output_size is the K / hidden axis after ModelSlim packing.
-        layer = self.build_layer()
-        gate_size = self.input_size // 2
-        layer.w13_weight.data[:, :gate_size, :] = 1
-        layer.w13_weight.data[:, gate_size:, :] = 2
-        layer.w13_weight_scale.data[:, : self.input_size] = 3.0
-        layer.w13_weight_scale.data[:, self.input_size :] = 4.0
-        layer.w13_scale_bias.data[:, : self.input_size] = 5.0
-        layer.w13_scale_bias.data[:, self.input_size :] = 6.0
+        intermediate = _CAM_TEST_INTERMEDIATE
+        hidden = _CAM_TEST_HIDDEN
+        layer = self.build_cam_layer(intermediate, hidden)
+        gate_packed = intermediate // 2
+        layer.w13_weight.data[:, :gate_packed, :] = 1
+        layer.w13_weight.data[:, gate_packed:, :] = 2
+        layer.w13_weight_scale.data[:, :intermediate] = 3.0
+        layer.w13_weight_scale.data[:, intermediate:] = 4.0
+        layer.w13_scale_bias.data[:, :intermediate] = 5.0
+        layer.w13_scale_bias.data[:, intermediate:] = 6.0
         layer.w2_scale_bias.data.fill_(7.0)
         self.quant_method.process_weights_after_loading(layer)
 
-        # The packing only regroups along K: every K row of the packed expert
-        # must still start with the gate half and keep N untouched.
-        cam_w13 = layer.cam_fused_deep_moe_w13_weight_list[0].view(torch.int8)
-        self.assertEqual(cam_w13.shape, (self.output_size, self.input_size))
-        expected_w13 = torch.tensor([1] * gate_size + [2] * gate_size, dtype=torch.int8)
+        cam_w13_nz = layer.cam_fused_deep_moe_w13_weight_list[0]
+        self.assertEqual(cam_w13_nz.shape, (hidden, intermediate // 4))
+        self.assertFalse(torch.equal(cam_w13_nz, _cam_int32_nz_to_nd(cam_w13_nz)))
+        cam_w13 = _cam_int32_nz_to_nd(cam_w13_nz).view(torch.int8)
+        self.assertEqual(cam_w13.shape, (hidden, intermediate))
+        expected_w13 = torch.tensor([2] * gate_packed + [1] * gate_packed, dtype=torch.int8)
         self.assertTrue(torch.equal(cam_w13, expected_w13.expand_as(cam_w13)))
         cam_scale = layer.cam_fused_deep_moe_w13_weight_scale_list[0]
-        self.assertTrue(torch.equal(cam_scale, torch.tensor([3.0] * self.input_size + [4.0] * self.input_size)))
+        self.assertTrue(torch.equal(cam_scale, torch.tensor([4.0] * intermediate + [3.0] * intermediate)))
         cam_bias = layer.cam_fused_deep_moe_w13_scale_bias_list[0]
-        self.assertTrue(torch.equal(cam_bias, torch.tensor([5.0] * self.input_size + [6.0] * self.input_size)))
-        # The A8W4 compensation matrix is required by the kernel; forwarding
-        # zeros (instead of the derived bias) corrupts every expert output.
+        self.assertTrue(torch.equal(cam_bias, torch.tensor([6.0] * intermediate + [5.0] * intermediate)))
+        # DFC stacked weights stay ModelSlim [gate|up]; only CAM copies swap.
+        dfc_w13 = layer.w13_weight.data.view(torch.int8)
+        expected_dfc = torch.tensor([1] * gate_packed + [2] * gate_packed, dtype=torch.int8)
+        self.assertTrue(torch.equal(dfc_w13[0], expected_dfc.expand_as(dfc_w13[0])))
         for w13_bias in layer.cam_fused_deep_moe_w13_scale_bias_list:
-            self.assertEqual(w13_bias.numel(), 2 * self.input_size)
+            self.assertEqual(w13_bias.numel(), 2 * intermediate)
             self.assertTrue(torch.count_nonzero(w13_bias) > 0)
         for w2_bias in layer.cam_fused_deep_moe_w2_scale_bias_list:
             self.assertTrue(torch.count_nonzero(w2_bias) > 0)
 
-    def test_cam_gmm1_payload_never_permutes_n_axis(self):
-        """Guard the payload against reintroducing an N-axis permute or swap.
-
-        The only N-axis layout the operator accepts is ModelSlim's natural
-        ``[gate | up]``, so the install helper must not reorder it.
-        """
+    def test_cam_gmm1_payload_uses_official_swap_and_nz(self):
+        """CAM install must follow the official sample: half-swap then ND->NZ."""
         payload_source = inspect.getsource(AscendW4A8DynamicFusedMoEMethod._install_cam_fused_deep_moe_payload)
-        for banned in ("_permute_gmm1_n", "_swap_last_dim_halves"):
-            self.assertNotIn(banned, payload_source)
+        self.assertIn("_swap_last_dim_halves", payload_source)
+        self.assertIn("_convert_nd_to_nz", payload_source)
+        self.assertNotIn("maybe_trans_nz", payload_source)
+        self.assertNotIn("npu_format_cast", payload_source)
 
     def test_pack_to_int32_asserts_packed_dim(self):
         weight = torch.zeros((self.experts, self.output_size, 10), dtype=torch.int8)
@@ -344,6 +400,40 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
 
         with self.assertRaisesRegex(AssertionError, re.escape(expected_message)):
             self.quant_method._pack_to_int32(weight)
+
+    def test_swap_last_dim_halves(self):
+        swapped = AscendW4A8DynamicFusedMoEMethod._swap_last_dim_halves(torch.tensor([[1, 1, 2, 2]]))
+        self.assertTrue(torch.equal(swapped, torch.tensor([[2, 2, 1, 1]])))
+        with self.assertRaisesRegex(ValueError, "even last dim"):
+            AscendW4A8DynamicFusedMoEMethod._swap_last_dim_halves(torch.zeros(3))
+
+    def test_convert_nd_to_nz_roundtrip(self):
+        rows, cols = 64, 16
+        nd = torch.arange(rows * cols, dtype=torch.int32).reshape(rows, cols)
+        nz = AscendW4A8DynamicFusedMoEMethod._convert_nd_to_nz(nd)
+        self.assertEqual(tuple(nz.shape), tuple(nd.shape))
+        self.assertFalse(torch.equal(nz, nd))
+        self.assertTrue(torch.equal(_cam_int32_nz_to_nd(nz), nd))
+        with self.assertRaisesRegex(ValueError, r"K%16==0"):
+            AscendW4A8DynamicFusedMoEMethod._convert_nd_to_nz(torch.zeros(15, 8, dtype=torch.int32))
+        with self.assertRaisesRegex(ValueError, "INT32"):
+            AscendW4A8DynamicFusedMoEMethod._convert_nd_to_nz(torch.zeros(16, 8, dtype=torch.int8))
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_current_vllm_config")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cam_fused_deep_moe", new=lambda _: True)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.use_cann_megamoe", new=lambda _: False)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.get_ascend_config")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8.maybe_trans_nz")
+    @patch("torch.Tensor.npu", new=lambda self: self, create=True)
+    def test_cam_payload_rejects_unaligned_int32_shape(
+        self, mock_maybe_trans_nz, mock_get_ascend_config, mock_vllm_config
+    ):
+        mock_maybe_trans_nz.side_effect = identity
+        mock_get_ascend_config.return_value.enable_fused_mc2 = 1
+        mock_vllm_config.return_value = object()
+        layer = self.build_layer()
+        with self.assertRaisesRegex(ValueError, "INT32 NZ shuffle"):
+            self.quant_method.process_weights_after_loading(layer)
 
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8._EXTRA_CTX")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8.build_fused_experts_input")

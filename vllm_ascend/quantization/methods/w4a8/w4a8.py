@@ -45,6 +45,11 @@ from vllm_ascend.utils import (
 from ..base import AscendMoEScheme, QuantType
 from ..registry import register_scheme
 
+# Official CAM sample ``convert_nd_to_nz`` INT32 fractal. Logical shape stays
+# ``[K, N]`` / ``[E, K, N]``; only the physical order is NZ-shuffled.
+_CAM_INT32_NZ_ROW_FRACTAL = 16
+_CAM_INT32_NZ_COL_FRACTAL = 8
+
 
 def _as_gmm_dequant_situ_quant_expert_weights(tensor_or_list: list[torch.Tensor] | torch.Tensor) -> list[torch.Tensor]:
     """Normalize W4A8 weights into one packed tensor per expert."""
@@ -356,6 +361,46 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         return weight.view(torch.int32).contiguous()
 
+    @staticmethod
+    def _swap_last_dim_halves(tensor: torch.Tensor) -> torch.Tensor:
+        """Swap the last-dim halves: ModelSlim ``[gate | up]`` -> CAM ``[up | gate]``."""
+        last = tensor.shape[-1]
+        if last % 2 != 0:
+            raise ValueError(
+                "CAM fused_deep_moe GMM1 [gate|up] -> [up|gate] swap requires an even last dim, "
+                f"got shape {tuple(tensor.shape)}"
+            )
+        half = last // 2
+        return torch.cat((tensor[..., half:], tensor[..., :half]), dim=-1)
+
+    @staticmethod
+    def _convert_nd_to_nz(weight: torch.Tensor) -> torch.Tensor:
+        """Match the official CAM sample ``convert_nd_to_nz`` for packed INT32.
+
+        Fractal is ``(16, 8)``. The tensor is reshaped back to the original
+        ``[..., K, N]`` so the format tag stays ND; only the storage order is NZ.
+        Do not ``npu_format_cast`` / ``maybe_trans_nz`` here: FRACTAL_NZ is rejected.
+        """
+        if weight.dtype != torch.int32:
+            raise ValueError(f"CAM fused_deep_moe NZ shuffle expects INT32, got {weight.dtype}.")
+        row_fractal, col_fractal = _CAM_INT32_NZ_ROW_FRACTAL, _CAM_INT32_NZ_COL_FRACTAL
+        *leading_dims, rows, cols = weight.shape
+        if rows % row_fractal != 0 or cols % col_fractal != 0:
+            raise ValueError(
+                "CAM fused_deep_moe INT32 NZ shuffle requires "
+                f"K%{row_fractal}==0 and N%{col_fractal}==0, got shape {tuple(weight.shape)}"
+            )
+        tiled = weight.reshape(
+            *leading_dims,
+            rows // row_fractal,
+            row_fractal,
+            cols // col_fractal,
+            col_fractal,
+        )
+        # Official order: keep batch dims, then ``[-2, -4, -3, -1]``.
+        permute_order = list(range(len(leading_dims))) + [-2, -4, -3, -1]
+        return tiled.permute(permute_order).reshape(*leading_dims, rows, cols).contiguous()
+
     def _pack_int8_nz_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
         """Reinterpret INT8 FRACTAL_NZ as INT32 without launching TransData.
 
@@ -406,46 +451,35 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w13_scale: torch.Tensor,
         w2_scale: torch.Tensor,
     ) -> None:
-        # Weights are still packed INT8 ND after ModelSlim / compressed-tensors.
-        # The installed aclnnFusedDeepMoe prototype only accepts INT32 ND
-        # gmm1/gmm2 weights (FRACTAL_NZ is rejected). Clone each expert in ND
-        # so TensorList entries have storage_offset 0, then pack INT8->INT32.
-        #
-        # Do NOT permute or swap the GMM1 N axis. ``fused_deep_moe`` pairs
-        # SwiGLU across the *global* N halves, not per GEMM tile: the epilogue
-        # uses ``isLeft = blockOffset.column() < layoutD.shape(1) / 2``
-        # (block_epilogue_per_token_dequant_swiglu.h) and the quant pass reads
-        # the partner at ``gmTileInput[layoutInput.shape(1) / 2]``
-        # (grouped_matmul_slice_m_per_token_dequant_swiglu_quant_*.h), i.e.
-        # ``out[j] = silu(y[j]) * y[j + intermediate]`` for a GMM1 output of
-        # ``2 * intermediate`` channels. ModelSlim already stores ``[gate | up]``
-        # and ``process_weights_after_loading_*`` leaves it that way, so the
-        # natural order is the required order. Scales and scale_bias are indexed
-        # by the same global column and must stay in that order too.
-        #
-        # ``*_scale_bias`` is the A8W4 asymmetric compensation matrix, not a
-        # zero bias: the kernel adds it to every dequantized tile
-        # (``C = (C_high * 16 + C_low + bias) * x_scale``), and
-        # ``process_weights_after_loading_*`` already materializes it as
-        # ``8 * sum_k(W_int4) * weight_scale``. Forwarding zeros corrupts every
-        # expert output.
+        # Official FusionOp (fused_deep_moe_sample_w4A8.py):
+        #   1. GMM1 N axis is ``[up | gate]``. Kernel SwiGLU is
+        #      ``silu(left) * right`` with ``act_left=true``. ModelSlim / this
+        #      loader keep ``[gate | up]`` on ``layer.w13_*`` for DFC, so only
+        #      the CAM copies are half-swapped. w2 is not swapped.
+        #   2. Pack INT8 ND -> INT32 ND, then ``convert_nd_to_nz`` (INT32
+        #      fractal 16x8, reshape back to ``[K, N]``). Host rejects a
+        #      FRACTAL_NZ *tag*; it still consumes NZ *storage*.
+        #   3. ``*_scale_bias`` is the A8W4 assist matrix
+        #      ``8 * sum_k(W_int4) * weight_scale``, not a zero bias.
+        # Clone after the ND swap so TensorList storage_offset is 0.
         w13 = layer.w13_weight.data
         w2 = layer.w2_weight.data
         num_experts = w13.shape[0]
+        w13_up_gate = self._swap_last_dim_halves(w13)
         layer.cam_fused_deep_moe_w13_weight_list = [
-            self._pack_to_int32(weight.clone()) for weight in w13.unbind(0)
+            self._convert_nd_to_nz(self._pack_to_int32(weight.clone())) for weight in w13_up_gate.unbind(0)
         ]
         layer.cam_fused_deep_moe_w2_weight_list = [
-            self._pack_to_int32(weight.clone()) for weight in w2.unbind(0)
+            self._convert_nd_to_nz(self._pack_to_int32(weight.clone())) for weight in w2.unbind(0)
         ]
         layer.cam_fused_deep_moe_w13_weight_scale_list = self._cam_per_expert_float_list(
-            w13_scale, num_experts
+            self._swap_last_dim_halves(w13_scale), num_experts
         )
         layer.cam_fused_deep_moe_w2_weight_scale_list = self._cam_per_expert_float_list(
             w2_scale, num_experts
         )
         layer.cam_fused_deep_moe_w13_scale_bias_list = self._cam_per_expert_float_list(
-            layer.w13_scale_bias.data, num_experts
+            self._swap_last_dim_halves(layer.w13_scale_bias.data), num_experts
         )
         layer.cam_fused_deep_moe_w2_scale_bias_list = self._cam_per_expert_float_list(
             layer.w2_scale_bias.data, num_experts
